@@ -1,10 +1,13 @@
 """Tests for the fixture exporter.
 
-The fixture is what CI trusts, so the exporter must fail loudly rather than
-quietly produce a narrower file than the warehouse needs.
+The fixture is what CI trusts and what any analysis explores, so it carries
+every column the source gave. What the exporter must never do is quietly ship
+a fixture missing a column the warehouse reads.
 """
 
 from __future__ import annotations
+
+import json
 
 import pandas as pd
 import pytest
@@ -12,19 +15,42 @@ import pytest
 from f1platform import fixtures as fx
 
 
-def test_trim_keeps_only_the_listed_columns():
-    frame = pd.DataFrame({"Driver": ["NOR"], "HeadshotUrl": ["http://x"], "LapTime": [72.6]})
-
-    trimmed = fx.trim(frame, ["Driver", "LapTime"], "laps")
-
-    assert list(trimmed.columns) == ["Driver", "LapTime"]
+def minimal(table: str) -> pd.DataFrame:
+    return pd.DataFrame({column: ["x"] for column in fx.REQUIRED_COLUMNS[table]})
 
 
-def test_trim_refuses_a_source_that_lost_a_column():
-    frame = pd.DataFrame({"Driver": ["NOR"]})
+def test_every_column_is_kept_by_default():
+    frame = minimal("laps").assign(SpeedST=[300.0], Position=[1.0])
 
-    with pytest.raises(KeyError, match="LapTime"):
-        fx.trim(frame, ["Driver", "LapTime"], "laps")
+    prepared = fx.prepare(frame, "laps")
+
+    assert "SpeedST" in prepared.columns
+    assert "Position" in prepared.columns
+
+
+def test_headshot_urls_are_excluded():
+    frame = minimal("results").assign(HeadshotUrl=["http://example/x.png"])
+
+    prepared = fx.prepare(frame, "results")
+
+    assert "HeadshotUrl" not in prepared.columns
+    assert "TeamName" in prepared.columns
+
+
+def test_a_source_that_lost_a_required_column_is_refused():
+    frame = minimal("laps").drop(columns=["LapTime"])
+
+    with pytest.raises(fx.MissingColumnsError, match="LapTime"):
+        fx.prepare(frame, "laps")
+
+
+def test_a_table_with_no_required_columns_is_kept_whole():
+    """Weather has no checklist; every column it brings is exported."""
+    frame = pd.DataFrame({"AirTemp": [22.0], "Rainfall": [True]})
+
+    prepared = fx.prepare(frame, "weather_data")
+
+    assert list(prepared.columns) == ["AirTemp", "Rainfall"]
 
 
 def test_a_missing_bronze_session_is_refused(tmp_path):
@@ -32,27 +58,36 @@ def test_a_missing_bronze_session_is_refused(tmp_path):
         fx.export("absent", tmp_path, tmp_path / "fixtures")
 
 
-def test_the_fixture_carries_every_column_the_warehouse_reads():
-    """Drift guard: warehouse.py selects these by name from the fixture."""
-    from f1platform import warehouse
-
-    sql = warehouse.SILVER_RESULTS + warehouse.SILVER_LAPS
-    for table, columns in fx.KEEP_COLUMNS.items():
-        for column in columns:
-            assert f'"{column}"' in sql, f"{table}.{column} is exported but unused"
-
-
-def test_export_round_trips_a_session(tmp_path):
+def test_optional_tables_are_skipped_not_fatal(tmp_path):
     bronze = tmp_path / "bronze" / "s"
     bronze.mkdir(parents=True)
-    pd.DataFrame({c: ["x"] for c in fx.KEEP_COLUMNS["results"]}).to_parquet(
-        bronze / "results.parquet", index=False
-    )
-    pd.DataFrame({c: ["x"] for c in fx.KEEP_COLUMNS["laps"]}).to_parquet(
+    minimal("results").to_parquet(bronze / "results.parquet", index=False)
+    minimal("laps").to_parquet(bronze / "laps.parquet", index=False)
+
+    target = fx.export("s", tmp_path / "bronze", tmp_path / "fixtures")
+    manifest = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
+
+    assert set(manifest["tables"]) == {"results", "laps"}
+    assert not (target / "weather_data.parquet").exists()
+
+
+def test_a_session_with_no_known_tables_is_refused(tmp_path):
+    bronze = tmp_path / "bronze" / "s"
+    bronze.mkdir(parents=True)
+
+    with pytest.raises(FileNotFoundError, match="held none of"):
+        fx.export("s", tmp_path / "bronze", tmp_path / "fixtures")
+
+
+def test_the_manifest_records_the_columns_exported(tmp_path):
+    bronze = tmp_path / "bronze" / "s"
+    bronze.mkdir(parents=True)
+    minimal("results").to_parquet(bronze / "results.parquet", index=False)
+    minimal("laps").assign(SpeedST=[1.0]).to_parquet(
         bronze / "laps.parquet", index=False
     )
 
     target = fx.export("s", tmp_path / "bronze", tmp_path / "fixtures")
+    manifest = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
 
-    assert (target / "results.parquet").exists()
-    assert (target / "laps.parquet").exists()
+    assert "SpeedST" in manifest["tables"]["laps"]["columns"]
