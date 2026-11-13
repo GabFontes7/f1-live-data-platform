@@ -1,7 +1,14 @@
 # F1 Live Data Platform
 
+[![CI](https://github.com/GabFontes7/f1-live-data-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/GabFontes7/f1-live-data-platform/actions/workflows/ci.yml)
+
 Records the Formula 1 live timing stream into a raw, replayable log, then turns it
 into a tested warehouse and a public race replay.
+
+Every push runs an acceptance test that rebuilds the FIA's published classification
+for the 2026 São Paulo Grand Prix from raw timing data — the podium, the three time
+penalties applied after the flag, both unclassified drivers and the fastest lap —
+against a 25 KB committed fixture. No Formula 1 account needed to verify it.
 
 **Status: phase 0 — the recorder.** The next live sessions are the Las Vegas Grand
 Prix (19–21 Nov 2026) and Abu Dhabi (4–6 Dec 2026). After that the feed goes quiet
