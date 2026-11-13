@@ -1,0 +1,94 @@
+{
+  "slug": "2026-sao-paulo-grand-prix-q",
+  "tables": {
+    "results": {
+      "rows": 22,
+      "columns": [
+        "DriverNumber",
+        "BroadcastName",
+        "Abbreviation",
+        "DriverId",
+        "TeamName",
+        "TeamColor",
+        "TeamId",
+        "FirstName",
+        "LastName",
+        "FullName",
+        "CountryCode",
+        "Position",
+        "ClassifiedPosition",
+        "GridPosition",
+        "Q1",
+        "Q2",
+        "Q3",
+        "Time",
+        "Status",
+        "Points",
+        "Laps"
+      ]
+    },
+    "laps": {
+      "rows": 391,
+      "columns": [
+        "Time",
+        "Driver",
+        "DriverNumber",
+        "LapTime",
+        "LapNumber",
+        "Stint",
+        "PitOutTime",
+        "PitInTime",
+        "Sector1Time",
+        "Sector2Time",
+        "Sector3Time",
+        "Sector1SessionTime",
+        "Sector2SessionTime",
+        "Sector3SessionTime",
+        "SpeedI1",
+        "SpeedI2",
+        "SpeedFL",
+        "SpeedST",
+        "IsPersonalBest",
+        "Compound",
+        "TyreLife",
+        "FreshTyre",
+        "Team",
+        "LapStartTime",
+        "LapStartDate",
+        "TrackStatus",
+        "Position",
+        "Deleted",
+        "DeletedReason",
+        "FastF1Generated",
+        "IsAccurate"
+      ]
+    },
+    "weather_data": {
+      "rows": 160,
+      "columns": [
+        "Time",
+        "AirTemp",
+        "Humidity",
+        "Pressure",
+        "Rainfall",
+        "TrackTemp",
+        "WindDirection",
+        "WindSpeed"
+      ]
+    },
+    "race_control_messages": {
+      "rows": 87,
+      "columns": [
+        "Time",
+        "Category",
+        "Message",
+        "Status",
+        "Flag",
+        "Scope",
+        "Sector",
+        "RacingNumber",
+        "Lap"
+      ]
+    }
+  }
+}
