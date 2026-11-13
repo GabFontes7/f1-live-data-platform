@@ -1,6 +1,6 @@
 """Record the Formula 1 live timing stream into a raw, append-only log.
 
-The raw log is this project's source of truth. Every byte the feed sends is
+The raw log is this project's source of truth. Whatever the feed sends is
 written to disk before anything tries to interpret it, which buys three
 things:
 
@@ -19,6 +19,7 @@ import asyncio
 import logging
 import sys
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,6 +29,7 @@ LOGGER = logging.getLogger("f1platform.record")
 
 DEFAULT_OUTPUT_DIR = Path("data/raw")
 DEFAULT_IDLE_TIMEOUT = 60
+DEFAULT_MAX_CONSECUTIVE_ERRORS = 3
 RECONNECT_BACKOFF_SECONDS = 5
 
 
@@ -52,7 +54,12 @@ def describe(path: Path) -> str:
     return f"{lines:,} lines, {size_mb:.1f} MB"
 
 
-def record_once(path: Path, idle_timeout: int, debug: bool) -> None:
+def size_of(path: Path) -> int:
+    """Bytes on disk, or 0 if the file does not exist yet."""
+    return path.stat().st_size if path.exists() else 0
+
+
+def record_once(path: Path, idle_timeout: int) -> None:
     """Run a single client session, appending to `path` if it already exists.
 
     SignalRClient exits on its own once `idle_timeout` seconds pass with no
@@ -63,7 +70,6 @@ def record_once(path: Path, idle_timeout: int, debug: bool) -> None:
     client = SignalRClient(
         filename=str(path),
         filemode=filemode,
-        debug=debug,
         timeout=idle_timeout,
     )
     asyncio.run(client.async_start())
@@ -74,13 +80,25 @@ def record(
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     idle_timeout: int = DEFAULT_IDLE_TIMEOUT,
     max_reconnects: int = 0,
-    debug: bool = True,
+    max_consecutive_errors: int = DEFAULT_MAX_CONSECUTIVE_ERRORS,
+    runner: Callable[[Path, int], None] = record_once,
 ) -> Path:
     """Record a session, reconnecting until the user stops it.
 
-    `max_reconnects=0` means reconnect indefinitely. The recorder is meant to
-    be started before a session and left alone, so giving up on the first
-    network hiccup would defeat its purpose.
+    Two kinds of failure are told apart, because they deserve opposite
+    responses:
+
+    * a **clean exit** means the client ran and then went quiet. That is what
+      a finished session looks like, and also what a silent network drop looks
+      like, so it is always worth reconnecting -- indefinitely when
+      `max_reconnects` is 0.
+    * an **exception** means the client could not run at all. A bad argument
+      or a broken install fails this way every single time, so retrying it
+      forever just fills the terminal with the same traceback. After
+      `max_consecutive_errors` in a row the recorder gives up and says so.
+
+    A single exception between good runs is forgiven: the counter resets on
+    any clean exit.
     """
     path = build_output_path(session, output_dir)
     LOGGER.info("recording %s", session)
@@ -88,20 +106,43 @@ def record(
     LOGGER.info("stop with Ctrl+C when the session is over")
 
     attempt = 0
+    consecutive_errors = 0
     started = time.monotonic()
+
     while True:
         attempt += 1
         if attempt > 1:
             LOGGER.info("reconnect attempt %d", attempt - 1)
+
+        bytes_before = size_of(path)
         try:
-            record_once(path, idle_timeout, debug)
+            runner(path, idle_timeout)
         except KeyboardInterrupt:
             LOGGER.info("stopped by user")
             break
-        except Exception:  # noqa: BLE001 - the supervisor must survive anything
-            LOGGER.exception("client failed; will reconnect")
-
-        LOGGER.info("client exited after %s", describe(path))
+        except Exception as error:  # noqa: BLE001 - the supervisor must survive anything
+            consecutive_errors += 1
+            LOGGER.error(
+                "client failed (%d in a row): %s: %s",
+                consecutive_errors,
+                type(error).__name__,
+                error,
+            )
+            if consecutive_errors >= max_consecutive_errors:
+                LOGGER.error(
+                    "giving up after %d failures in a row -- this looks like a bug "
+                    "or a bad argument, not a network problem",
+                    consecutive_errors,
+                )
+                break
+        else:
+            consecutive_errors = 0
+            captured = size_of(path) - bytes_before
+            LOGGER.info(
+                "client exited cleanly, captured %s this run (%s total)",
+                f"{captured:,} bytes",
+                describe(path),
+            )
 
         if max_reconnects and (attempt - 1) >= max_reconnects:
             LOGGER.info("reconnect limit reached, stopping")
@@ -150,11 +191,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="stop after this many reconnects; 0 means never stop (default: 0)",
     )
     parser.add_argument(
-        "--no-debug-messages",
-        action="store_true",
+        "--max-consecutive-errors",
+        type=int,
+        default=DEFAULT_MAX_CONSECUTIVE_ERRORS,
         help=(
-            "store only the payload instead of the complete SignalR message; "
-            "the complete message is kept by default because it is the raw truth"
+            "stop after this many failures in a row, which signal a bug rather "
+            f"than a network problem (default: {DEFAULT_MAX_CONSECUTIVE_ERRORS})"
         ),
     )
     return parser
@@ -174,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
         output_dir=args.output_dir,
         idle_timeout=args.idle_timeout,
         max_reconnects=args.max_reconnects,
-        debug=not args.no_debug_messages,
+        max_consecutive_errors=args.max_consecutive_errors,
     )
     return 0
 

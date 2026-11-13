@@ -19,10 +19,16 @@ mid-season.
 ## Decision
 
 Every byte received from the feed is appended to a raw log on disk before anything
-parses it. The recorder performs no interpretation at all; it stores the complete
-SignalR message, not just the payload.
+parses it. The recorder performs no interpretation of its own, and subscribes to all
+20 topics the feed publishes rather than a chosen subset.
 
 The raw log is treated as immutable. Nothing downstream ever writes back to it.
+
+FastF1's own `SignalRClient` does the receiving. Its former `debug` mode, which stored
+the complete SignalR envelope rather than the message payload, was removed in FastF1
+3.x and now raises on use, so the payload is what gets stored. Writing our own client
+to recover the envelope was considered and rejected for phase 0: the envelope carries
+transport framing, not race data, and the deadline is the next live session.
 
 ## Consequences
 
@@ -36,8 +42,9 @@ not re-collecting data that no longer exists.
 **A format change costs a parser, not the data.** If the feed changes shape, every
 session already captured is still complete and can be re-parsed by the new code.
 
-**Storage grows.** The complete message is larger than the payload alone. This is
-accepted: disk is cheap and the data is irreplaceable.
+**Storage grows.** Subscribing to every topic costs more disk than picking the few a
+feature needs today. This is accepted: disk is cheap and the data is irreplaceable,
+and a topic not captured during a session can never be captured again.
 
 ## Alternatives considered
 
