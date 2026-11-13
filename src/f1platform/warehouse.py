@@ -307,13 +307,18 @@ from 1 to 0 are the crossover -- the most interesting laps of the race.
 
 # Qualifying runs in segments, and the timing feed does not label them: a lap
 # arrives with no mark saying whether it was Q1, Q2 or Q3. What the feed does
-# show is the track emptying between segments, so the laps fall into blocks
-# separated by minutes of nobody running. The blocks are numbered in order.
+# show is the track emptying between runs, so the laps fall into blocks
+# separated by minutes of nobody running.
 #
-# The guess is then checked, in gold_qualifying_result, against the segment
-# times the result itself publishes. In the 2026 Sao Paulo qualifying the
-# blocks held 22, 15 and 10 drivers and every driver's best lap in each block
-# matched the published time to the millisecond.
+# Numbering those blocks in order is the obvious guess and it is wrong: the
+# 2026 Mexico City qualifying was red-flagged, which splits a segment into
+# two blocks and produced five. So each block is instead matched to a segment
+# by the times the result itself publishes -- a block belongs to the segment
+# whose published times the most drivers set in it. A block nobody's best lap
+# came from inherits the segment running before it.
+#
+# gold_qualifying_result then checks the whole mapping against those same
+# published times, and says so when it does not hold.
 SEGMENT_BREAK_SECONDS = 180
 
 GOLD_QUALIFYING_SEGMENTS = f"""
@@ -334,24 +339,63 @@ blocks AS (
                                       ROWS UNBOUNDED PRECEDING) AS block
     FROM gaps
 ),
--- A block where nobody set a time is not a segment: it is cars going to the
--- end of the pit lane, or a session waiting for the rain to stop.
-running AS (
-    SELECT block, min(at_seconds) AS started
-    FROM blocks GROUP BY block HAVING count(lap_time_seconds) > 0
+-- The fastest lap each driver set in each block, which is what a published
+-- segment time is.
+block_best AS (
+    SELECT block, driver_code,
+           min(lap_time_seconds) FILTER (WHERE NOT is_deleted) AS best_seconds
+    FROM blocks GROUP BY block, driver_code
 ),
-numbered AS (
-    SELECT block, row_number() OVER (ORDER BY started) AS segment_number
-    FROM running
+published AS (
+    SELECT driver_code, 1 AS segment_number, q1_seconds AS at_seconds
+    FROM silver_results WHERE q1_seconds IS NOT NULL
+    UNION ALL
+    SELECT driver_code, 2, q2_seconds FROM silver_results WHERE q2_seconds IS NOT NULL
+    UNION ALL
+    SELECT driver_code, 3, q3_seconds FROM silver_results WHERE q3_seconds IS NOT NULL
+),
+-- Each block votes: how many drivers' best lap in it is exactly a time the
+-- result publishes for a given segment.
+votes AS (
+    SELECT b.block, p.segment_number, count(*) AS votes
+    FROM block_best AS b
+    JOIN published AS p
+      ON p.driver_code = b.driver_code
+     AND abs(p.at_seconds - b.best_seconds) < 0.0005
+    GROUP BY b.block, p.segment_number
+),
+chosen AS (
+    SELECT block, arg_max(segment_number, votes) AS segment_number
+    FROM votes GROUP BY block
+),
+-- A block nobody's best lap came from -- an installation run, or laps before
+-- a red flag that were all beaten later -- belongs to whichever segment was
+-- running at the time, which is the last one identified before it.
+filled AS (
+    SELECT
+        b.block,
+        coalesce(
+            c.segment_number,
+            last_value(c.segment_number IGNORE NULLS) OVER (
+                ORDER BY b.block ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ),
+            first_value(c.segment_number IGNORE NULLS) OVER (
+                ORDER BY b.block ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+            )
+        ) AS segment_number
+    FROM (SELECT DISTINCT block FROM blocks) AS b
+    LEFT JOIN chosen AS c USING (block)
 )
 SELECT
     b.session_slug,
     b.driver_code,
     b.lap_number,
-    n.segment_number,
-    'Q' || n.segment_number AS segment
+    f.segment_number,
+    'Q' || f.segment_number AS segment,
+    b.block
 FROM blocks AS b
-JOIN numbered AS n USING (block)
+JOIN filled AS f USING (block)
+WHERE f.segment_number IS NOT NULL
 """
 
 GOLD_QUALIFYING_RESULT = """
@@ -400,11 +444,22 @@ SELECT
     best_seconds - min(best_seconds) OVER ()       AS gap_to_pole_seconds,
     CASE WHEN reached_segment = 3 THEN NULL
          ELSE reached_segment END                  AS eliminated_in,
-    -- Did the blocks we inferred reproduce the published segment times? A
-    -- tenth of a millisecond of slack covers the rounding, nothing more.
-    coalesce(abs(coalesce(measured_q1, 0) - coalesce(q1_seconds, 0)) < 0.0005, TRUE)
-    AND coalesce(abs(coalesce(measured_q2, 0) - coalesce(q2_seconds, 0)) < 0.0005, TRUE)
-    AND coalesce(abs(coalesce(measured_q3, 0) - coalesce(q3_seconds, 0)) < 0.0005, TRUE)
+    -- Did the blocks we inferred reproduce the published segment times? Half
+    -- a millisecond of slack covers the rounding, nothing more. A segment the
+    -- result does not publish is not a disagreement: in the 2026 Mexico City
+    -- qualifying one driver has no published times at all while the timing
+    -- data has his laps, which is a gap in the result, not in the inference.
+    (q1_seconds IS NOT NULL OR q2_seconds IS NOT NULL
+     OR q3_seconds IS NOT NULL)                     AS has_published_times,
+    (CASE WHEN q1_seconds IS NULL THEN TRUE
+          WHEN measured_q1 IS NULL THEN FALSE
+          ELSE abs(measured_q1 - q1_seconds) < 0.0005 END)
+    AND (CASE WHEN q2_seconds IS NULL THEN TRUE
+              WHEN measured_q2 IS NULL THEN FALSE
+              ELSE abs(measured_q2 - q2_seconds) < 0.0005 END)
+    AND (CASE WHEN q3_seconds IS NULL THEN TRUE
+              WHEN measured_q3 IS NULL THEN FALSE
+              ELSE abs(measured_q3 - q3_seconds) < 0.0005 END)
                                                    AS matches_published
 FROM joined
 ORDER BY qualifying_position

@@ -80,6 +80,42 @@ def dry_laps(**kwargs):
             for driver in ("FST", "SLW", "DNF") for number in range(1, 7)]
 
 
+def test_one_session_is_rendered_even_when_the_warehouse_holds_several(tmp_path):
+    """Every table with a session_slug is scoped, including ones added later."""
+    from tests.test_warehouse import make_qualifying_results, qualifying_laps
+
+    db_path = tmp_path / "many.duckdb"
+    first = write_bronze(tmp_path / "a", make_qualifying_results(
+        q1=[95.0, 95.4, 95.9], q2=[94.0, 94.4, None], q3=[93.0, None, None]
+    ), qualifying_laps())
+    warehouse.build(SESSION, first, db_path)
+
+    second = tmp_path / "b"
+    (second / "2026-other-q").mkdir(parents=True)
+    other = make_qualifying_results(
+        q1=[85.0, 85.4, 85.9], q2=[84.0, 84.4, None], q3=[83.0, None, None]
+    )
+    other.to_parquet(second / "2026-other-q" / "results.parquet", index=False)
+    laps = qualifying_laps()
+    laps["LapTime"] = laps["LapTime"] - 10.0
+    laps.to_parquet(second / "2026-other-q" / "laps.parquet", index=False)
+    warehouse.build("2026-other-q", second, db_path)
+
+    connection = duckdb.connect(str(db_path), read_only=True)
+    try:
+        report.scope_to_session(connection, SESSION)
+        drivers, rows = connection.execute(
+            "SELECT count(DISTINCT driver_code), count(*) "
+            "FROM gold_qualifying_result"
+        ).fetchone()
+        page = report.render(connection, SESSION)
+    finally:
+        connection.close()
+
+    assert (drivers, rows) == (3, 3), "the other session must not leak in"
+    assert "1:25.000" not in page, "no lap from the other session on the page"
+
+
 def test_a_qualifying_session_gets_its_own_page(tmp_path):
     """A qualifying session is not a short race: different tabs, different cards."""
     from tests.test_warehouse import make_qualifying_results, qualifying_laps

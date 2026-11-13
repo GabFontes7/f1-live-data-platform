@@ -146,53 +146,48 @@ def table_of(
     )
 
 
-# Tables the page reads. Each is scoped to one session before rendering, so
-# a warehouse holding a whole season renders one session at a time.
-SESSION_TABLES = (
-    "silver_results",
-    "silver_laps",
-    "silver_weather",
-    "silver_race_control",
-    "gold_race_classification",
-    "gold_fastest_lap",
-    "gold_representative_laps",
-    "gold_stint_pace",
-    "gold_track_state",
-    "gold_session_profile",
-    "gold_position_changes",
-    "gold_teammate_delta",
-    "gold_overtake_aid",
-)
-
-
-def scope_to_session(connection: duckdb.DuckDBPyConnection, slug: str) -> None:
-    """Point every table name at one session's rows.
+def scope_to_session(connection: duckdb.DuckDBPyConnection, slug: str) -> str:
+    """Point every table name at one session's rows, and say which tables.
 
     The warehouse holds many sessions. Rather than adding a filter to forty
-    queries -- where one forgotten filter silently mixes two races -- each
+    queries -- where one forgotten filter silently mixes two sessions -- each
     name becomes a temp view over that session alone.
+
+    Every stored table carrying a `session_slug` is scoped, rather than a
+    list kept by hand. A list is a thing to forget: the first version of this
+    function had one, a qualifying table was added without it, and a page
+    quietly rendered two qualifying sessions on top of each other.
     """
     catalog = connection.execute(
         "SELECT database_name FROM duckdb_databases() "
         "WHERE database_name NOT IN ('system', 'temp') LIMIT 1"
     ).fetchone()[0]
-    stored = {
+    tables = [
         row[0]
         for row in connection.execute(
-            "SELECT table_name FROM duckdb_tables() WHERE database_name = ? "
-            "AND schema_name = 'main'",
+            """
+            SELECT t.table_name FROM duckdb_tables() AS t
+            WHERE t.database_name = ? AND t.schema_name = 'main'
+              AND EXISTS (
+                  SELECT 1 FROM duckdb_columns() AS c
+                  WHERE c.database_name = t.database_name
+                    AND c.table_name = t.table_name
+                    AND c.column_name = 'session_slug'
+              )
+            ORDER BY t.table_name
+            """,
             [catalog],
         ).fetchall()
-    }
+    ]
     # DuckDB will not take a bound parameter inside CREATE VIEW, so the slug
     # is quoted into the statement with its quotes doubled.
     literal = "'" + slug.replace("'", "''") + "'"
-    for table in SESSION_TABLES:
-        if table in stored:
-            connection.execute(
-                f'CREATE OR REPLACE TEMP VIEW "{table}" AS SELECT * FROM '
-                f'"{catalog}".main."{table}" WHERE session_slug = {literal}'
-            )
+    for table in tables:
+        connection.execute(
+            f'CREATE OR REPLACE TEMP VIEW "{table}" AS SELECT * FROM '
+            f'"{catalog}".main."{table}" WHERE session_slug = {literal}'
+        )
+    return catalog
 
 
 def has_table(connection: duckdb.DuckDBPyConnection, name: str) -> bool:
@@ -1758,6 +1753,26 @@ TAB_REQUIRES = {"weather": "silver_weather", "control": "silver_race_control"}
 HOVER_HINT = "<span class='hint'>🖱️ Passe o mouse para ver os detalhes.</span>"
 
 
+def incomplete_timing_note(connection: duckdb.DuckDBPyConnection) -> str:
+    """Say so when the timing data holds fewer laps than the result counts.
+
+    The 2026 Mexico City race was red-flagged and the timing data this
+    pipeline receives stops at lap 56, while the classification credits the
+    winner with 71. Rather than draw a 56-lap race and call it the race, the
+    page says which number came from where.
+    """
+    profile = session_profile(connection)
+    timed, classified = profile.get("laps_run"), profile.get("race_laps")
+    if not timed or not classified or classified <= timed:
+        return ""
+    return f"""<p class="warn"><b>Faltam voltas na cronometragem.</b> O
+resultado credita {plural(int(classified), 'volta', 'voltas')} ao vencedor,
+mas os dados de cronometragem que recebemos vão até a volta {int(timed)} —
+{plural(int(classified - timed), 'volta', 'voltas')} de diferença. Todo
+gráfico desta página é desenhado com o que a cronometragem tem, e a tabela de
+classificação é a publicada. Não preenchemos o buraco com estimativa.</p>"""
+
+
 def tab_summary(connection: duckdb.DuckDBPyConnection) -> str:
     _state, bands = track_condition(connection)
     strips = {
@@ -1772,6 +1787,7 @@ def tab_summary(connection: duckdb.DuckDBPyConnection) -> str:
     condition_note = " ".join(strips[band] for band in bands)
     return f"""{podium(connection)}
 {summary_cards(connection)}
+{incomplete_timing_note(connection)}
 <h2>Tempo de volta ao longo da corrida</h2>
 <p class="note">Um ponto por volta, na cor do composto. Ficam de fora voltas
 sob bandeira amarela, voltas deletadas e voltas de entrada ou saída do box:
@@ -2027,9 +2043,15 @@ def qualifying_lap_chart(connection: duckdb.DuckDBPyConnection) -> str:
 
     height = 420
     times = sorted(row[1] for row in rows)
-    low, high = times[0], times[int(len(times) * 0.97)]
+    # A qualifying session is full of slow laps -- preparation, cooling,
+    # running under a flag -- that are three times the pole time and would
+    # squash every lap that matters into the bottom of the chart. The window
+    # is the fast laps; the ones left out are counted under the chart.
+    low = times[0]
+    high = min(times[int(len(times) * 0.9)], low * 1.18)
     pad = (high - low) * 0.06
     low, high = low - pad, high + pad
+    hidden = sum(1 for row in rows if not low <= row[1] <= high)
     minutes = [row[0] for row in rows]
     first, last = min(minutes), max(minutes)
     x0, x1 = PAD_L, WIDTH - PAD_R
@@ -2093,6 +2115,12 @@ def qualifying_lap_chart(connection: duckdb.DuckDBPyConnection) -> str:
                        f"class='series-label' fill='{colour}'>POLE "
                        f"{esc(code)}</text>")
     out.append("</svg>")
+    if hidden:
+        out.append(
+            f"<p class='count'>{plural(hidden, 'volta', 'voltas')} acima de "
+            f"{fmt_lap(high)} ficaram fora do gráfico — preparação, "
+            "refrigeração e voltas sob bandeira, que esmagariam a escala.</p>"
+        )
     return "".join(out)
 
 
@@ -2306,9 +2334,19 @@ def segment_note(connection: duckdb.DuckDBPyConnection) -> str:
         FROM gold_qualifying_segments AS s GROUP BY s.segment ORDER BY s.segment
         """
     ).fetchall()
-    checked, matched = connection.execute(
-        "SELECT count(*), sum(matches_published::int) FROM gold_qualifying_result"
+    checked, matched, unpublished = connection.execute(
+        "SELECT count(*) FILTER (WHERE has_published_times), "
+        "sum(matches_published::int) FILTER (WHERE has_published_times), "
+        "count(*) FILTER (WHERE NOT has_published_times) "
+        "FROM gold_qualifying_result"
     ).fetchone()
+    missing = [
+        row[0]
+        for row in connection.execute(
+            "SELECT driver_code FROM gold_qualifying_result "
+            "WHERE NOT has_published_times ORDER BY driver_code"
+        ).fetchall()
+    ]
     shape = ", ".join(
         f"{segment} com {plural(drivers, 'piloto', 'pilotos')} e "
         f"{plural(laps, 'volta', 'voltas')}"
@@ -2321,10 +2359,18 @@ def segment_note(connection: duckdb.DuckDBPyConnection) -> str:
         f"<b>{checked - (matched or 0)} piloto(s) não bateram com o tempo "
         "publicado</b>, então trate a divisão por segmento com desconfiança"
     )
+    gap = ""
+    if unpublished:
+        gap = (f" Fica de fora da conferência quem o resultado não traz tempo "
+               f"nenhum: {esc(', '.join(missing))} — a cronometragem tem as "
+               "voltas, o resultado não as publica.")
     return f"""<p class="note">A cronometragem não diz a qual segmento cada
 volta pertence: ela manda voltas soltas. Nós deduzimos olhando a pista
-esvaziar — minutos sem ninguém marcando tempo separam um segmento do
-seguinte. Deu {shape}. Para conferir a dedução, {verdict}.</p>"""
+esvaziar — minutos sem ninguém marcando tempo separam um bloco de corrida do
+seguinte — e então amarramos cada bloco ao segmento cujos tempos publicados os
+pilotos cravaram ali. Numerar os blocos em ordem não serve: uma bandeira
+vermelha parte um segmento em dois. Deu {shape}. Para conferir a dedução,
+{verdict}.{gap}</p>"""
 
 
 def tab_qualifying_summary(connection: duckdb.DuckDBPyConnection) -> str:
