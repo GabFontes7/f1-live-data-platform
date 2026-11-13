@@ -103,8 +103,10 @@ SELECT
 FROM read_parquet(?)
 """
 
-# A track-temperature sensor that reports 0 C at Interlagos is not reporting
-# a temperature. One sample of 160 in the Sao Paulo race reads exactly 0.0,
+# A track-temperature sensor that reports exactly 0.0 C during a session is
+# not reporting a temperature, at any circuit: asphalt under running cars
+# does not sit at a round zero for one minute between two readings in the
+# twenties. First seen in the 2026 Sao Paulo race: one sample of 160 reads 0.0,
 # and the readings taken while it was raining swing by 15 C between
 # consecutive minutes. Zero becomes NULL; the swings are left alone and
 # flagged, because they are noisy measurements rather than absent ones.
@@ -230,6 +232,41 @@ MIN_LAPS_FOR_PACE = 4
 # Compounds run when the track is wet. Their stints are dominated by the
 # track drying, not by the tyre wearing out.
 WET_COMPOUNDS = ("INTERMEDIATE", "WET")
+
+# The track is called wet on a lap when at least this share of the cars on
+# it are running a wet-weather compound.
+WET_TRACK_SHARE = 0.5
+
+GOLD_TRACK_STATE = f"""
+CREATE OR REPLACE TABLE gold_track_state AS
+SELECT
+    session_slug,
+    lap_number,
+    count(*)                                          AS cars_on_track,
+    sum((compound IN {WET_COMPOUNDS})::INT)           AS cars_on_wet_tyres,
+    sum((compound IN {WET_COMPOUNDS})::INT)::DOUBLE
+        / count(*)                                    AS wet_tyre_share,
+    sum((compound IN {WET_COMPOUNDS})::INT)::DOUBLE
+        / count(*) >= {WET_TRACK_SHARE}               AS is_wet_track
+FROM silver_laps
+WHERE compound IS NOT NULL
+GROUP BY session_slug, lap_number
+ORDER BY lap_number
+"""
+"""Why the track's state is read from the tyres, not from the weather feed.
+
+The weather feed carries a `Rainfall` flag, sampled about once a minute at
+one point of the circuit. It answers "is water falling on the sensor right
+now", which is a different question from "is the track wet". In the 2026
+São Paulo race it was true in 7 of 160 samples, while every car ran
+intermediates for the first 14 laps and the last 9.
+
+Twenty teams choosing a tyre is a better instrument: nobody stays on
+intermediates on a dry track or on slicks on a wet one for long. So a lap
+counts as wet when at least half the cars on it are on a wet-weather
+compound, and the share itself is kept, because the laps where it moves
+from 1 to 0 are the crossover -- the most interesting laps of the race.
+"""
 
 # Two medians are comparable only when both drivers ran a similar share of
 # the race. Below this ratio of representative laps, the delta is measuring
@@ -394,6 +431,7 @@ def build(
         connection.execute(GOLD_FASTEST_LAP)
         connection.execute(GOLD_REPRESENTATIVE_LAPS)
         connection.execute(GOLD_STINT_PACE)
+        connection.execute(GOLD_TRACK_STATE)
         connection.execute(GOLD_TEAMMATE_DELTA)
 
         for table in (
@@ -403,6 +441,7 @@ def build(
             "gold_fastest_lap",
             "gold_representative_laps",
             "gold_stint_pace",
+            "gold_track_state",
             "gold_teammate_delta",
             *loaded_optional,
         ):

@@ -265,7 +265,16 @@ def lap_time_chart(connection: duckdb.DuckDBPyConnection) -> str:
     if not rows:
         return "<p class='empty'>Nenhuma volta representativa.</p>"
 
-    height = 400
+    state = (
+        connection.execute(
+            "SELECT lap_number, cars_on_track, cars_on_wet_tyres, wet_tyre_share "
+            "FROM gold_track_state ORDER BY lap_number"
+        ).fetchall()
+        if has_table(connection, "gold_track_state")
+        else []
+    )
+    strip = 46 if state else 0
+    height = 400 + strip
     times = sorted(row[1] for row in rows)
     low = times[int(len(times) * 0.005)]
     high = times[int(len(times) * 0.995) - 1]
@@ -274,10 +283,35 @@ def lap_time_chart(connection: duckdb.DuckDBPyConnection) -> str:
     laps = [row[0] for row in rows]
     first, last = min(laps), max(laps)
     x0, x1 = PAD_L, WIDTH - PAD_R
-    y0, y1 = PAD_T, height - PAD_B
+    y0, y1 = PAD_T, height - PAD_B - strip
 
     out = [f"<svg viewBox='0 0 {WIDTH} {height}' role='img' class='focusable' "
            "aria-label='Tempo de cada volta ao longo da corrida, por composto'>"]
+    if state:
+        # The track's state, read from the tyres: one cell per lap, darker
+        # the larger the share of cars on a wet-weather compound.
+        cell = (x1 - x0) / max(last - first, 1)
+        sy = y1 + 34
+        out.append(f"<text x='{x1 + 18}' y='{sy + 9}' class='tick'>"
+                   "💦 pista molhada</text>")
+        out.append(f"<text x='{x1 + 18}' y='{sy + 21}' class='tick'>"
+                   "(% em pneu de chuva)</text>")
+        for lap, cars, wet_cars, share in state:
+            if not first <= lap <= last:
+                continue
+            hover = tip(
+                f"Volta {lap} · estado da pista",
+                f"{wet_cars} de {cars} carros em pneu intermediário ou de chuva "
+                f"({share * 100:.0f}%)",
+                "Pista molhada" if share >= 0.5 else
+                ("Pista secando / começando a molhar" if share > 0
+                 else "Pista seca"),
+            )
+            out.append(
+                f"<rect x='{scale(lap, first, last, x0, x1) - cell / 2:.1f}' "
+                f"y='{sy}' width='{cell + 0.3:.1f}' height='16' fill='#0067ad' "
+                f"fill-opacity='{0.06 + share * 0.8:.2f}' class='column'{hover}/>"
+            )
     for index in range(6):
         value = low + (high - low) * index / 5
         y = scale(value, low, high, y1, y0)
@@ -289,8 +323,7 @@ def lap_time_chart(connection: duckdb.DuckDBPyConnection) -> str:
         x = scale(lap, first, last, x0, x1)
         out.append(f"<text x='{x:.1f}' y='{y1 + 22}' text-anchor='middle' "
                    f"class='tick'>{lap}</text>")
-    out.append(f"<text x='{(x0 + x1) / 2:.0f}' y='{height - 2}' "
-               "text-anchor='middle' class='tick'>volta</text>")
+    out.append(f"<text x='{x1 + 10}' y='{y1 + 22}' class='tick'>volta</text>")
     for lap_number, seconds, compound, code, tyre_life, position in rows:
         if not low <= seconds <= high:
             continue
@@ -331,8 +364,20 @@ def position_chart(connection: duckdb.DuckDBPyConnection) -> str:
     for row in rows:
         by_driver.setdefault(row[0], []).append(row[1:])
 
-    laps = [row[1] for row in rows]
-    positions = [row[2] for row in rows]
+    # Lap 0 is the grid. The timing feed's first position is the END of lap
+    # one, which hides the start -- often the biggest move of the race.
+    # A grid position of 0 means a pit-lane start: there is no slot to draw.
+    grid = {
+        code: int(position)
+        for code, position in connection.execute(
+            "SELECT driver_code, grid_position FROM silver_results "
+            "WHERE grid_position IS NOT NULL AND grid_position > 0"
+        ).fetchall()
+        if code in by_driver
+    }
+
+    laps = [row[1] for row in rows] + ([0] if grid else [])
+    positions = [row[2] for row in rows] + list(grid.values())
     first, last = min(laps), max(laps)
     top, bottom = min(positions), max(positions)
     height = 540
@@ -349,18 +394,31 @@ def position_chart(connection: duckdb.DuckDBPyConnection) -> str:
                    f"class='tick'>P{position}</text>")
     for lap in range(first, last + 1, 5):
         x = scale(lap, first, last, x0, x1)
+        label = "largada" if lap == 0 else lap
         out.append(f"<text x='{x:.1f}' y='{y1 + 22}' text-anchor='middle' "
-                   f"class='tick'>{lap}</text>")
+                   f"class='tick'>{label}</text>")
     out.append(f"<text x='{(x0 + x1) / 2:.0f}' y='{height - 2}' "
                "text-anchor='middle' class='tick'>volta</text>")
 
     hits = []
     for code, points in by_driver.items():
         colour = colours.get(code, UNKNOWN_COLOUR)
+        trace = [(point[0], point[1]) for point in points]
+        if code in grid:
+            trace.insert(0, (0, grid[code]))
+            gx = scale(0, first, last, x0, x1)
+            gy = scale(grid[code], top, bottom, y0, y1)
+            after = (f"Fim da volta 1: P{int(points[0][1])}"
+                     if points[0][0] == 1 else None)
+            hover = tip(f"{code} · largada", f"P{grid[code]} no grid", after)
+            out.append(f"<rect x='{gx - 3.5:.1f}' y='{gy - 3.5:.1f}' width='7' "
+                       f"height='7' fill='{colour}' data-d='{esc(code)}'/>")
+            hits.append(f"<circle cx='{gx:.1f}' cy='{gy:.1f}' r='6' "
+                        f"fill='transparent' data-d='{esc(code)}'{hover}/>")
         path = " ".join(
-            f"{'M' if index == 0 else 'L'}{scale(point[0], first, last, x0, x1):.1f} "
-            f"{scale(point[1], top, bottom, y0, y1):.1f}"
-            for index, point in enumerate(points)
+            f"{'M' if index == 0 else 'L'}{scale(lap, first, last, x0, x1):.1f} "
+            f"{scale(position, top, bottom, y0, y1):.1f}"
+            for index, (lap, position) in enumerate(trace)
         )
         out.append(f"<path d='{path}' fill='none' stroke='{colour}' "
                    f"stroke-width='1.8' stroke-opacity='0.85' data-d='{esc(code)}'/>")
@@ -730,7 +788,7 @@ def speed_chart(connection: duckdb.DuckDBPyConnection) -> str:
                    f"width='{x1 - x0}' height='{row_height}' "
                    f"fill='transparent'{hover}/>")
         out.append(f"<text x='{x1 + 10}' y='{y + 4:.1f}' class='tick'>"
-                   f"{mid:.0f} km/h</text>")
+                   f"<tspan class='strong'>{mid:.0f} km/h</tspan> mediana</text>")
     out.append("</svg>")
     return "".join(out)
 
@@ -825,7 +883,7 @@ def weather_cards(connection: duckdb.DuckDBPyConnection) -> str:
         return f"{lo:.0f}{unit}" if round(lo) == round(hi) else f"{lo:.0f}–{hi:.0f}{unit}"
 
     cards = [
-        ("🌧️", "Chuva", f"{rain} de {samples} min"),
+        ("🌧️", "Chuva caindo no sensor", f"{rain} de {samples} min"),
         ("🛣️", "Temperatura da pista", span(track_lo, track_hi, " °C")),
         ("🌡️", "Temperatura do ar", span(air_lo, air_hi, " °C")),
         ("💧", "Umidade", span(hum_lo, hum_hi, " %")),
@@ -841,7 +899,11 @@ def weather_cards(connection: duckdb.DuckDBPyConnection) -> str:
         for icon, label, value in cards
     )
     return (f"<div class='cards'>{body}</div>"
-            f"<p class='note'>Valores medidos {scope}.</p>")
+            f"<p class='note'>Valores medidos {scope}. Atenção ao primeiro "
+            "cartão: a estação mede se está <b>caindo água no sensor</b> "
+            "naquele minuto, em um único ponto do circuito — não se a pista "
+            "está molhada. Para o estado da pista, veja a faixa azul no gráfico "
+            "de tempo de volta, na aba Resumo, que é lida dos pneus.</p>")
 
 
 def weather_chart(connection: duckdb.DuckDBPyConnection) -> str:
@@ -1331,11 +1393,14 @@ def summary_cards(connection: duckdb.DuckDBPyConnection) -> str:
     fastest = connection.execute(
         "SELECT driver_code, lap_time_seconds FROM gold_fastest_lap"
     ).fetchone()
-    rain = (
+    race_laps = connection.execute(
+        "SELECT max(laps_completed) FROM silver_results"
+    ).fetchone()[0]
+    wet_laps = (
         connection.execute(
-            "SELECT sum(is_raining::int), count(*) FROM silver_weather"
+            "SELECT sum(is_wet_track::int), count(*) FROM gold_track_state"
         ).fetchone()
-        if has_table(connection, "silver_weather")
+        if has_table(connection, "gold_track_state")
         else None
     )
     messages = (
@@ -1347,13 +1412,20 @@ def summary_cards(connection: duckdb.DuckDBPyConnection) -> str:
     cards = []
     if fastest:
         cards.append(("⚡", "Volta mais rápida", f"{fastest[0]} {fmt_lap(fastest[1])}"))
+    if race_laps:
+        cards.insert(0, ("🏁", "Distância da corrida",
+                         plural(int(race_laps), "volta", "voltas")))
+    if wet_laps and wet_laps[1]:
+        cards.append(("💦", "Voltas com pista molhada",
+                      f"{wet_laps[0] or 0} de {wet_laps[1]}"))
     cards += [
-        ("🔁", "Voltas registradas", f"{total:,}".replace(",", ".")),
-        ("✅", "Voltas limpas (servem para ritmo)", f"{usable or 0:,}".replace(",", ".")),
-        ("🌧️", "Stints com pneu de chuva", f"{wet or 0} de {stints}"),
+        ("🔁", "Voltas cronometradas, somando todos os pilotos",
+         f"{total:,}".replace(",", ".")),
+        ("✅", "Dessas, limpas (servem para medir ritmo)",
+         f"{usable or 0:,}".replace(",", ".")),
+        ("🛞", "Stints em pneu intermediário ou de chuva",
+         f"{wet or 0} de {stints}"),
     ]
-    if rain and rain[0] is not None:
-        cards.append(("☔", "Minutos com chuva", f"{rain[0]} de {rain[1]}"))
     if messages:
         cards.append(("📻", "Mensagens da direção de prova", f"{messages[0]:,}".replace(",", ".")))
 
@@ -1380,7 +1452,9 @@ def tab_summary(connection: duckdb.DuckDBPyConnection) -> str:
 <p class="note">Um ponto por volta, na cor do composto. Ficam de fora voltas
 sob bandeira amarela, voltas deletadas e voltas de entrada ou saída do box:
 nenhuma delas se compara com uma volta limpa. {HOVER_HINT} Parar sobre um ponto
-destaca todas as voltas daquele piloto.</p>
+destaca todas as voltas daquele piloto. A faixa azul embaixo mostra o estado da
+pista: quanto mais escura, maior a parte do grid em pneu intermediário ou de
+chuva naquela volta.</p>
 {lap_time_chart(connection)}
 {compound_legend(connection)}
 <h2>Classificação</h2>
@@ -1391,8 +1465,9 @@ resultado publicado pela FIA. Linhas em cinza não foram classificadas.</p>
 
 def tab_race(connection: duckdb.DuckDBPyConnection) -> str:
     return f"""<h2>Posição, volta a volta</h2>
-<p class="note">Uma linha por piloto, na cor da equipe. A bolinha branca marca
-a volta em que ele entrou no box. {HOVER_HINT} A linha do piloto fica em
+<p class="note">Uma linha por piloto, na cor da equipe, começando no grid de
+largada (o quadradinho). A bolinha branca marca a volta em que ele entrou no
+box. {HOVER_HINT} A linha do piloto fica em
 destaque e as outras se apagam.</p>
 {position_chart(connection)}
 <h2>Estratégia</h2>
@@ -1436,9 +1511,11 @@ de leituras idênticas à volta anterior do mesmo piloto: {esc(share_text)}. E a
 própria documentação do FastF1 descreve o <code>SpeedST</code> como
 "maybe a speed trap on the longest straight (?)". Sirva-se da ordem de
 grandeza, não da casa decimal.</p>
-<p class="note">A bolinha é a <b>mediana</b> (não a média) das voltas que não
-foram de entrada nem de saída do box; a linha vai da mínima à máxima.
+<p class="note">Voltas de entrada e de saída do box ficam de fora.
 {HOVER_HINT}</p>
+<div class="legend range-key"><span>mínima</span><i class="range-line"></i>
+<span class="range-dot"></span><b>mediana</b> — metade das voltas acima, metade
+abaixo (não é a média)<i class="range-line"></i><span>máxima</span></div>
 {speed_chart(connection)}
 <h2>Os quatro radares</h2>
 <p class="note">Mediana por piloto. A célula roxa é o mais veloz da coluna; as
@@ -1451,9 +1528,10 @@ def tab_weather(connection: duckdb.DuckDBPyConnection) -> str:
 {weather_cards(connection)}
 <h2>Linha do tempo</h2>
 <p class="note">Uma leitura por minuto, do início da sessão ao fim. A faixa
-clara é a corrida e as faixas azuis são os minutos com chuva. O anel vermelho
-marca uma leitura em que o sensor da pista informou exatamente 0&nbsp;°C — em
-Interlagos isso é falha, não temperatura, e o valor é guardado como nulo.
+clara é a corrida e as faixas azuis são os minutos em que o sensor registrou
+chuva caindo. O anel vermelho marca uma leitura em que o sensor da pista
+informou exatamente 0&nbsp;°C — isso é falha do sensor, não temperatura, e o
+valor é guardado como nulo.
 {HOVER_HINT} O desenho da pista entra aqui quando ingerirmos os dados de
 posição dos carros.</p>
 {weather_chart(connection)}"""
@@ -1617,6 +1695,12 @@ svg.focus [data-d] { opacity: .1; transition: opacity .08s; }
 svg.focus [data-d].on { opacity: 1; }
 svg.focus path.on { stroke-width: 3.2; }
 svg.focus circle.on[fill-opacity] { r: 4; fill-opacity: 1; }
+.tick .strong { font-weight: 700; fill: #1a1a19; }
+.range-key { align-items: center; gap: 8px; margin: 0 2px 9px; }
+.range-line { display: inline-block; width: 46px; height: 3px; border-radius: 2px;
+              background: #b9b9b3; }
+.range-dot { display: inline-block; width: 11px; height: 11px; border-radius: 50%;
+             background: #1a1a19; }
 .legend { display: flex; gap: 15px; flex-wrap: wrap; margin: 7px 2px 0;
           font-size: 13px; color: #45453f; }
 .key i { display: inline-block; width: 10px; height: 10px; border-radius: 2px;

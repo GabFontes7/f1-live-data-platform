@@ -269,6 +269,27 @@ def test_a_yellow_flag_lap_is_not_green(pace):
     assert is_green is False, "TrackStatus '12' means a yellow appeared mid-lap"
 
 
+def test_the_track_is_wet_when_most_cars_are_on_wet_tyres(tmp_path):
+    """The track's state is read from the tyres, lap by lap."""
+    rows = [lap("FST", 1, 95.0, compound="INTERMEDIATE"),
+            lap("SLW", 1, 96.0, compound="INTERMEDIATE"),
+            lap("DNF", 1, 97.0, compound="SOFT"),
+            lap("FST", 2, 90.0), lap("SLW", 2, 91.0),
+            lap("DNF", 2, 92.0, compound="INTERMEDIATE")]
+    bronze = write_bronze(tmp_path / "bronze", make_pace_results(), pd.DataFrame(rows))
+    db_path = warehouse.build(SESSION, bronze, tmp_path / "t.duckdb")
+    connection = duckdb.connect(str(db_path), read_only=True)
+    try:
+        state = connection.execute(
+            "SELECT lap_number, cars_on_track, cars_on_wet_tyres, is_wet_track "
+            "FROM gold_track_state ORDER BY lap_number"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert state == [(1, 3, 2, True), (2, 3, 1, False)]
+
+
 def test_a_short_stint_reports_no_pace(pace):
     row = pace.execute(
         "SELECT representative_laps, median_pace_seconds, lap_time_trend_s_per_lap "

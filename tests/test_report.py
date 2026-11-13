@@ -50,8 +50,24 @@ def test_every_lap_dot_says_who_and_when(rendered):
     _page, connection = rendered
     chart = report.lap_time_chart(connection)
 
-    assert chart.count("data-tip=") == chart.count("<circle")
+    assert chart.count("data-d=") == chart.count("<circle")
     assert "FST · volta 1" in chart
+
+
+def test_the_position_chart_starts_on_the_grid(rendered):
+    """Lap 0 is the grid slot: the start must not be hidden inside lap one."""
+    _page, connection = rendered
+    chart = report.position_chart(connection)
+
+    assert "FST · largada" in chart
+    assert "largada</text>" in chart, "the axis names lap 0"
+
+
+def test_the_track_state_is_drawn_under_the_lap_chart(rendered):
+    _page, connection = rendered
+    laps = connection.execute("SELECT count(*) FROM gold_track_state").fetchone()[0]
+
+    assert report.lap_time_chart(connection).count("estado da pista") == laps
 
 
 def test_messages_about_one_incident_become_one_story():
