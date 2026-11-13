@@ -29,7 +29,18 @@ f1-record --check-auth
 
 # during a live session
 f1-record --session 2026-las-vegas-fp1
+
+# after a session: bronze, then the warehouse
+f1-ingest --year 2026 --event "Sao Paulo Grand Prix" --session R
+f1-build --session 2026-sao-paulo-grand-prix-r
+pytest -q
 ```
+
+The last command runs the acceptance test, which rebuilds the FIA's published
+classification for that race from the raw data: the podium, the three time
+penalties applied after the flag, both unclassified drivers, and the fastest lap.
+It runs against the committed fixture in CI and against your own ingested copy
+when you have one.
 
 ### Authentication
 

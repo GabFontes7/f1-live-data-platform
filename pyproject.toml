@@ -23,6 +23,7 @@ f1-record = "f1platform.record:main"
 f1-ingest = "f1platform.ingest:main"
 f1-schema = "f1platform.schema:main"
 f1-build = "f1platform.warehouse:main"
+f1-fixture = "f1platform.fixtures:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -9,9 +9,10 @@ One assertion exercises four business rules at once: finishing order,
 time penalties applied after the flag, the 90%-distance classification rule,
 and the fastest-lap award going only to a classified driver on a valid lap.
 
-The test skips when the bronze data is absent, because that data is not
-committed. Run `f1-ingest --year 2026 --event "Sao Paulo Grand Prix"
---session R` first.
+It runs twice where possible: against the committed fixture, so CI proves it
+too, and against a freshly ingested bronze session when one is on disk. The
+same assertions over two copies of the data also catch a fixture that has
+drifted from what the source now returns.
 """
 
 from __future__ import annotations
@@ -25,6 +26,11 @@ from f1platform import warehouse
 
 SESSION = "2026-sao-paulo-grand-prix-r"
 BRONZE_DIR = Path("data/bronze")
+FIXTURE_DIR = Path("tests/fixtures")
+
+# The fixture is committed, so CI runs the first of these. The second runs
+# only on a machine that has ingested the session itself.
+SOURCES = [("fixture", FIXTURE_DIR), ("bronze", BRONZE_DIR)]
 
 EXPECTED_PODIUM = ["NOR", "VER", "HAD"]
 EXPECTED_POSITIONS = {"ANT": 5, "LEC": 8, "BEA": 17}
@@ -34,15 +40,16 @@ EXPECTED_WINNER_LAPS = 71
 EXPECTED_WINNER_POINTS = 25.0
 
 
-@pytest.fixture(scope="module")
-def warehouse_db(tmp_path_factory):
-    if not (BRONZE_DIR / SESSION / "results.parquet").exists():
+@pytest.fixture(scope="module", params=SOURCES, ids=lambda source: source[0])
+def warehouse_db(request, tmp_path_factory):
+    name, directory = request.param
+    if not (directory / SESSION / "results.parquet").exists():
         pytest.skip(
-            f"bronze data for {SESSION} is not present; run f1-ingest first "
-            "(the data is deliberately not committed)"
+            f"no {name} copy of {SESSION}. For bronze, run f1-ingest; for the "
+            "fixture, run f1-fixture and commit the result"
         )
-    db_path = tmp_path_factory.mktemp("warehouse") / "acceptance.duckdb"
-    warehouse.build(SESSION, BRONZE_DIR, db_path)
+    db_path = tmp_path_factory.mktemp(f"warehouse-{name}") / "acceptance.duckdb"
+    warehouse.build(SESSION, directory, db_path)
     connection = duckdb.connect(str(db_path), read_only=True)
     yield connection
     connection.close()
