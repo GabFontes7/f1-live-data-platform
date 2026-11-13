@@ -209,6 +209,47 @@ def test_missing_session_is_refused_before_anything_runs(monkeypatch):
     assert called["recorded"] is False
 
 
+def test_a_rejected_password_fails_before_the_client_starts(monkeypatch, tmp_path):
+    """FastF1 answers a bad password with TypeError from deep in SignalR.
+
+    Pre-authenticating turns that into a sentence naming the real problem.
+    """
+    started = {"client": False}
+
+    def rejected():
+        raise rec.AuthError("F1 sign-in failed: bad password")
+
+    monkeypatch.setattr(rec, "sign_in", rejected)
+    monkeypatch.setattr(
+        rec, "SignalRClient", lambda **kwargs: started.update(client=True)
+    )
+
+    with pytest.raises(rec.AuthError):
+        rec.record_once(tmp_path / "never-written.txt", idle_timeout=5)
+
+    assert started["client"] is False, "a bad password must not reach the client"
+
+
+def test_no_auth_skips_the_sign_in(monkeypatch, tmp_path):
+    calls = {"signed_in": False, "client": False}
+
+    monkeypatch.setattr(rec, "sign_in", lambda: calls.update(signed_in=True))
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            calls["client"] = True
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(rec, "SignalRClient", FakeClient)
+
+    rec.record_once(tmp_path / "x.txt", idle_timeout=5, no_auth=True)
+
+    assert calls["signed_in"] is False
+    assert calls["client"] is True
+
+
 def test_check_auth_exit_code_follows_the_result(monkeypatch):
     monkeypatch.setattr(rec, "check_auth", lambda: True)
     assert rec.main(["--check-auth"]) == 0

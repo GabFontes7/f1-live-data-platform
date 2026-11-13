@@ -101,36 +101,57 @@ def interrupt_guard():
         signal.signal(signal.SIGINT, previous)
 
 
-def check_auth() -> bool:
-    """Sign in to the F1 account now and report whether it worked.
+class AuthError(RuntimeError):
+    """Raised when the F1 sign-in fails, instead of letting the client guess."""
 
-    The feed requires a (free) Formula 1 account. Finding that out while a
-    session is running is too late, so this runs the sign-in on demand, days
-    early. FastF1 stores the resulting token on disk and reuses it, which is
-    why a reconnect mid-session does not prompt again.
+
+def sign_in() -> None:
+    """Obtain a livetiming token, raising a readable error if that fails.
+
+    This runs *before* the client starts, on purpose. Left to itself, FastF1
+    reacts to a rejected password by logging a warning, continuing without
+    authentication, and then failing inside the SignalR layer with
+    ``TypeError: access_token_factory is not function`` -- a message that says
+    nothing about the actual problem, which is a typo in a password.
 
     Credentials come from the environment variables ``F1_USERNAME`` and
     ``F1_PASSWORD``; without them an interactive terminal is prompted.
     """
     try:
         from fastf1.internals.f1account import get_token
-    except ImportError as error:
-        LOGGER.error(
-            "this FastF1 version does not expose the account helper (%s); "
-            "sign-in behaviour has changed and the recorder needs updating",
-            error,
-        )
-        return False
+    except ImportError as error:  # pragma: no cover - version drift
+        raise AuthError(
+            f"this FastF1 version does not expose the account helper ({error}); "
+            "sign-in behaviour has changed and the recorder needs updating"
+        ) from error
 
+    try:
+        get_token()
+    except Exception as error:  # noqa: BLE001 - any failure means "do not proceed"
+        raise AuthError(
+            f"F1 sign-in failed: {error}. Check the account at "
+            "https://account.formula1.com, run --check-auth to retry the login, "
+            "or pass --no-auth to connect without it"
+        ) from error
+
+
+def check_auth() -> bool:
+    """Sign in now and report whether it worked.
+
+    The feed requires a (free) Formula 1 account. Finding that out while a
+    session is running is too late, so this runs the sign-in on demand, days
+    early. FastF1 stores the resulting token on disk and reuses it, which is
+    why a reconnect mid-session does not prompt again.
+    """
     if os.environ.get("F1_USERNAME"):
         LOGGER.info("using credentials from F1_USERNAME / F1_PASSWORD")
     else:
         LOGGER.info("F1_USERNAME is not set, so you will be prompted")
 
     try:
-        get_token()
-    except Exception as error:  # noqa: BLE001 - any failure means "do not rely on it"
-        LOGGER.error("sign-in failed: %s: %s", type(error).__name__, error)
+        sign_in()
+    except AuthError as error:
+        LOGGER.error("%s", error)
         return False
 
     LOGGER.info("sign-in succeeded; the token is stored and will be reused")
@@ -144,6 +165,9 @@ def record_once(path: Path, idle_timeout: int, no_auth: bool = False) -> None:
     message. That is the normal way a session ends, and also how a silent
     connection drop surfaces -- the supervisor decides whether to reconnect.
     """
+    if not no_auth:
+        sign_in()
+
     filemode = "a" if path.exists() else "w"
     client = SignalRClient(
         filename=str(path),
