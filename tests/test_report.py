@@ -34,8 +34,72 @@ def page(rendered):
 
 
 def test_the_page_is_self_contained(page):
-    assert "<script" not in page, "no JavaScript: the report must open offline"
+    """One inline script (the tooltip, ADR 0004) and nothing fetched."""
+    assert page.count("<script") == 1, "exactly one script: the inline tooltip"
+    assert " src=" not in page, "nothing is loaded from anywhere"
     assert "http://" not in page and "https://" not in page, "no external assets"
+
+
+def test_the_tooltip_script_only_reads_what_python_wrote():
+    """The page is complete without the script: it computes and fetches nothing."""
+    for forbidden in ("fetch(", "XMLHttpRequest", "innerHTML", "eval("):
+        assert forbidden not in report.TOOLTIP_SCRIPT
+
+
+def test_every_lap_dot_says_who_and_when(rendered):
+    _page, connection = rendered
+    chart = report.lap_time_chart(connection)
+
+    assert chart.count("data-tip=") == chart.count("<circle")
+    assert "FST · volta 1" in chart
+
+
+def test_messages_about_one_incident_become_one_story():
+    """Noted, investigated, penalised and served: four messages, one card."""
+    stamp = "(14:50:05)"
+    messages = [
+        (37, None, f"TURN 1 INCIDENT INVOLVING CARS 23 (ALB) AND 10 (GAS) NOTED {stamp}", None),
+        (40, None, "FIA STEWARDS: TURN 1 INCIDENT INVOLVING CARS 23 (ALB) AND 10 (GAS) "
+                   f"UNDER INVESTIGATION {stamp}", None),
+        (42, None, "FIA STEWARDS: 5 SECOND TIME PENALTY FOR CAR 23 (ALB) - "
+                   f"REJOINING UNSAFELY {stamp}", None),
+        (46, None, "FIA STEWARDS: PENALTY SERVED - 5 SECOND TIME PENALTY FOR "
+                   f"CAR 23 (ALB) {stamp}", None),
+        (3, None, "INCIDENT INVOLVING CAR 3 (VER) NOTED - FALSE START (14:03:17)", None),
+    ]
+
+    incidents = report.build_incidents(messages)
+
+    assert len(incidents) == 2
+    story = incidents[0]
+    assert story["cars"] == {"ALB", "GAS"} and story["turn"] == "1"
+    assert [step[0] for step in story["steps"]] == [37, 40, 42, 46]
+    assert [step[2] for step in story["steps"]] == ["open", "open", "penalty", "served"]
+    assert story["reason"] == "Voltou à pista de forma insegura"
+
+
+def test_two_incidents_at_the_same_second_stay_separate():
+    """Two cars jumping the same start share a clock time, not an incident."""
+    messages = [
+        (3, None, "INCIDENT INVOLVING CAR 23 (ALB) NOTED - FALSE START (14:03:17)", None),
+        (3, None, "INCIDENT INVOLVING CAR 3 (VER) NOTED - FALSE START (14:03:17)", None),
+    ]
+
+    assert len(report.build_incidents(messages)) == 2
+
+
+@pytest.mark.parametrize(
+    ("flag", "message", "kind"),
+    [
+        ("BLUE", "WAVED BLUE FLAG FOR CAR 51 (CAM)", "blue"),
+        ("DOUBLE YELLOW", "DOUBLE YELLOW IN TRACK SECTOR 13", "yellow"),
+        (None, "CAR 5 (BOR) TIME 1:28.993 DELETED - TRACK LIMITS AT TURN 1 LAP 15", "deleted"),
+        (None, "FIA STEWARDS: 10 SECOND TIME PENALTY FOR CAR 27 (HUL)", "penalty"),
+        (None, "OVERTAKE DISABLED", "track"),
+    ],
+)
+def test_race_control_messages_are_sorted_into_kinds(flag, message, kind):
+    assert report.classify_message(flag, message) == kind
 
 
 def test_every_driver_appears_in_the_classification(page):
@@ -86,7 +150,7 @@ def test_a_session_without_laps_says_so_instead_of_drawing_nothing(tmp_path):
     finally:
         connection.close()
 
-    assert "No representative laps" in rendered
+    assert "Nenhuma volta representativa" in rendered
 
 
 def test_a_missing_warehouse_is_refused(tmp_path):
@@ -95,10 +159,10 @@ def test_a_missing_warehouse_is_refused(tmp_path):
 
 
 def test_a_lapped_driver_shows_the_lap_deficit(rendered):
-    """The screens say "+1 lap", not a blank cell."""
+    """The screens say "+1 volta", not a blank cell."""
     page, _ = rendered
 
-    assert "+1 lap" in page
+    assert "+1 volta" in page
 
 
 def test_driver_names_are_escaped(page):
