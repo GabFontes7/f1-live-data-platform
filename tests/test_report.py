@@ -63,11 +63,76 @@ def test_the_position_chart_starts_on_the_grid(rendered):
     assert "largada</text>" in chart, "the axis names lap 0"
 
 
+def build_page(tmp_path, laps, name="x"):
+    """Render a whole page from a handful of laps."""
+    bronze = write_bronze(tmp_path / name, make_pace_results(), pd.DataFrame(laps))
+    db_path = tmp_path / f"{name}.duckdb"
+    warehouse.build(SESSION, bronze, db_path)
+    connection = duckdb.connect(str(db_path), read_only=True)
+    try:
+        return report.render(connection, SESSION), report.track_condition(connection)[1]
+    finally:
+        connection.close()
+
+
+def dry_laps(**kwargs):
+    return [lap(driver, number, 90.0 + number * 0.1, **kwargs)
+            for driver in ("FST", "SLW", "DNF") for number in range(1, 7)]
+
+
+def test_a_dry_race_says_nothing_about_rain(tmp_path):
+    """The page describes this session, not the one the code was written for.
+
+    A card reading "0 of 71 laps with a wet track" is a leftover from the
+    2026 Sao Paulo race, which is why this test exists.
+    """
+    page, bands = build_page(tmp_path, dry_laps(), name="dry")
+
+    assert "wet" not in bands
+    assert "pista molhada" not in page
+    assert "Voltas com pista molhada" not in page
+    assert "pneu intermediário" not in page
+    assert "card-label'>Voltas com" not in page, (
+        "a card counting zero laps of something that did not happen is noise"
+    )
+
+
+def test_a_wet_race_does_say_so(tmp_path):
+    page, bands = build_page(tmp_path, dry_laps(compound="INTERMEDIATE"), name="wet")
+
+    assert "wet" in bands
+    assert "Voltas com pista molhada" in page
+
+
+def test_a_race_without_neutralisation_draws_no_flag_band(tmp_path):
+    _page, bands = build_page(tmp_path, dry_laps(), name="green")
+
+    assert bands == []
+
+
+def test_a_safety_car_earns_its_band_and_its_card(tmp_path):
+    laps = dry_laps()
+    for row in laps:
+        if row["LapNumber"] in (3.0, 4.0):
+            row["TrackStatus"] = "14"
+    page, bands = build_page(tmp_path, laps, name="sc")
+
+    assert bands == ["neutralisation"]
+    assert "Voltas com safety car" in page
+    assert "Safety car na pista" in page, "the band explains itself on hover"
+
+
 def test_the_track_state_is_drawn_under_the_lap_chart(rendered):
     _page, connection = rendered
-    laps = connection.execute("SELECT count(*) FROM gold_track_state").fetchone()[0]
+    wet_laps = connection.execute(
+        "SELECT count(*) FROM gold_track_state WHERE wet_tyre_share > 0"
+    ).fetchone()[0]
+    chart = report.lap_time_chart(connection)
 
-    assert report.lap_time_chart(connection).count("estado da pista") == laps
+    assert chart.count("fill='#0067ad'") == wet_laps, "one cell per wet lap"
+    assert "Pista secando ou começando a molhar" in chart, (
+        "a third of the grid on intermediates is not a wet track yet"
+    )
 
 
 def test_messages_about_one_incident_become_one_story():

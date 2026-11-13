@@ -269,6 +269,29 @@ def test_a_yellow_flag_lap_is_not_green(pace):
     assert is_green is False, "TrackStatus '12' means a yellow appeared mid-lap"
 
 
+def test_the_profile_counts_what_happened_in_the_session(tmp_path):
+    """One row saying what the session was, so the report can decide."""
+    rows = []
+    for driver, offset in (("FST", 0.0), ("SLW", 1.0), ("DNF", 2.0)):
+        for number in range(1, 6):
+            status = "14" if number == 3 else "1"
+            rows.append(lap(driver, number, 90.0 + offset, status=status,
+                            position=1 + offset))
+    rows.append(lap("SLW", 6, 95.0, pit_in=1.0, position=2.0))
+    bronze = write_bronze(tmp_path / "bronze", make_pace_results(), pd.DataFrame(rows))
+    db_path = warehouse.build(SESSION, bronze, tmp_path / "p.duckdb")
+    connection = duckdb.connect(str(db_path), read_only=True)
+    try:
+        profile = connection.execute(
+            "SELECT laps_run, safety_car_laps, wet_laps, pit_stops, winner "
+            "FROM gold_session_profile"
+        ).fetchone()
+    finally:
+        connection.close()
+
+    assert profile == (6, 1, 0, 1, "FST")
+
+
 def test_the_track_is_wet_when_most_cars_are_on_wet_tyres(tmp_path):
     """The track's state is read from the tyres, lap by lap."""
     rows = [lap("FST", 1, 95.0, compound="INTERMEDIATE"),

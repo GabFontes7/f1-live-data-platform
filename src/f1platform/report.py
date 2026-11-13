@@ -160,6 +160,54 @@ def team_colours(connection: duckdb.DuckDBPyConnection) -> dict[str, str]:
     }
 
 
+# What a neutralisation looks like on the condition strip. Green draws
+# nothing: an uneventful lap should leave the strip empty, not grey.
+NEUTRALISATION = {
+    "yellow": ("#e8c33a", "Bandeira amarela em algum setor"),
+    "vsc": ("#d98324", "Safety car virtual"),
+    "safety_car": ("#e8710a", "Safety car na pista"),
+    "red": ("#b91c1c", "Bandeira vermelha"),
+}
+
+
+def session_profile(connection: duckdb.DuckDBPyConnection) -> dict:
+    """One row describing what happened, or {} when it was not built."""
+    if not has_table(connection, "gold_session_profile"):
+        return {}
+    cursor = connection.execute("SELECT * FROM gold_session_profile")
+    row = cursor.fetchone()
+    if row is None:
+        return {}
+    columns = [column[0] for column in cursor.description]
+    return dict(zip(columns, row, strict=True))
+
+
+def track_condition(
+    connection: duckdb.DuckDBPyConnection,
+) -> tuple[list[tuple], list[str]]:
+    """Per-lap condition, and which bands have anything to say.
+
+    A band is drawn only when the session produced it. A dry race with no
+    neutralisation gets no strip at all, rather than an empty one captioned
+    with a phenomenon that did not happen.
+    """
+    if not has_table(connection, "gold_track_state"):
+        return [], []
+    rows = connection.execute(
+        """
+        SELECT lap_number, cars_on_track, cars_on_wet_tyres, wet_tyre_share,
+               neutralisation
+        FROM gold_track_state ORDER BY lap_number
+        """
+    ).fetchall()
+    bands = []
+    if any(row[3] for row in rows):
+        bands.append("wet")
+    if any(row[4] != "green" for row in rows):
+        bands.append("neutralisation")
+    return rows, bands
+
+
 def finishing_order(connection: duckdb.DuckDBPyConnection) -> list[str]:
     return [
         row[0]
@@ -265,15 +313,8 @@ def lap_time_chart(connection: duckdb.DuckDBPyConnection) -> str:
     if not rows:
         return "<p class='empty'>Nenhuma volta representativa.</p>"
 
-    state = (
-        connection.execute(
-            "SELECT lap_number, cars_on_track, cars_on_wet_tyres, wet_tyre_share "
-            "FROM gold_track_state ORDER BY lap_number"
-        ).fetchall()
-        if has_table(connection, "gold_track_state")
-        else []
-    )
-    strip = 46 if state else 0
+    state, bands = track_condition(connection)
+    strip = 30 + 26 * len(bands) if bands else 0
     height = 400 + strip
     times = sorted(row[1] for row in rows)
     low = times[int(len(times) * 0.005)]
@@ -287,30 +328,40 @@ def lap_time_chart(connection: duckdb.DuckDBPyConnection) -> str:
 
     out = [f"<svg viewBox='0 0 {WIDTH} {height}' role='img' class='focusable' "
            "aria-label='Tempo de cada volta ao longo da corrida, por composto'>"]
-    if state:
-        # The track's state, read from the tyres: one cell per lap, darker
-        # the larger the share of cars on a wet-weather compound.
-        cell = (x1 - x0) / max(last - first, 1)
-        sy = y1 + 34
-        out.append(f"<text x='{x1 + 18}' y='{sy + 9}' class='tick'>"
-                   "💦 pista molhada</text>")
-        out.append(f"<text x='{x1 + 18}' y='{sy + 21}' class='tick'>"
-                   "(% em pneu de chuva)</text>")
-        for lap, cars, wet_cars, share in state:
+    cell = (x1 - x0) / max(last - first, 1)
+    for index, band in enumerate(bands):
+        sy = y1 + 34 + index * 26
+        label = ("💦 pista molhada (% do grid em pneu de chuva)"
+                 if band == "wet" else "🚩 corrida neutralizada")
+        out.append(f"<text x='{x0 - 8}' y='{sy + 12}' text-anchor='end' "
+                   f"class='tick'>{label.split(' ')[0]}</text>")
+        out.append(f"<text x='{x1 + 10}' y='{sy + 12}' class='tick'>"
+                   f"{esc(label.split(' ', 1)[1])}</text>")
+        out.append(f"<rect x='{x0}' y='{sy}' width='{x1 - x0}' height='16' "
+                   "rx='3' fill='#f4f4f2'/>")
+        for lap, cars, wet_cars, share, neutralisation in state:
             if not first <= lap <= last:
                 continue
-            hover = tip(
-                f"Volta {lap} · estado da pista",
-                f"{wet_cars} de {cars} carros em pneu intermediário ou de chuva "
-                f"({share * 100:.0f}%)",
-                "Pista molhada" if share >= 0.5 else
-                ("Pista secando / começando a molhar" if share > 0
-                 else "Pista seca"),
-            )
+            x = scale(lap, first, last, x0, x1) - cell / 2
+            if band == "wet":
+                if not share:
+                    continue
+                colour, opacity = "#0067ad", 0.12 + share * 0.78
+                detail = (f"{wet_cars} de {cars} carros em pneu intermediário "
+                          f"ou de chuva ({share * 100:.0f}%)")
+                headline = ("Pista molhada" if share >= 0.5
+                            else "Pista secando ou começando a molhar")
+            else:
+                if neutralisation == "green":
+                    continue
+                colour, opacity = NEUTRALISATION[neutralisation][0], 0.9
+                headline = NEUTRALISATION[neutralisation][1]
+                detail = None
+            hover = tip(f"Volta {lap}", headline, detail)
             out.append(
-                f"<rect x='{scale(lap, first, last, x0, x1) - cell / 2:.1f}' "
-                f"y='{sy}' width='{cell + 0.3:.1f}' height='16' fill='#0067ad' "
-                f"fill-opacity='{0.06 + share * 0.8:.2f}' class='column'{hover}/>"
+                f"<rect x='{x:.1f}' y='{sy}' width='{cell + 0.3:.1f}' "
+                f"height='16' fill='{colour}' fill-opacity='{opacity:.2f}' "
+                f"class='column'{hover}/>"
             )
     for index in range(6):
         value = low + (high - low) * index / 5
@@ -883,7 +934,6 @@ def weather_cards(connection: duckdb.DuckDBPyConnection) -> str:
         return f"{lo:.0f}{unit}" if round(lo) == round(hi) else f"{lo:.0f}–{hi:.0f}{unit}"
 
     cards = [
-        ("🌧️", "Chuva caindo no sensor", f"{rain} de {samples} min"),
         ("🛣️", "Temperatura da pista", span(track_lo, track_hi, " °C")),
         ("🌡️", "Temperatura do ar", span(air_lo, air_hi, " °C")),
         ("💧", "Umidade", span(hum_lo, hum_hi, " %")),
@@ -892,6 +942,9 @@ def weather_cards(connection: duckdb.DuckDBPyConnection) -> str:
         ("🧭", "Direção do vento", compass(wind_dir)),
         ("⏲️", "Pressão", "—" if pressure is None else f"{pressure:.0f} mbar"),
     ]
+    if rain:
+        cards.insert(0, ("🌧️", "Minutos com água no sensor",
+                         f"{rain} de {samples}"))
     body = "".join(
         f"<div class='card'><span class='card-icon'>{icon}</span>"
         f"<span class='card-value'>{esc(value)}</span>"
@@ -899,11 +952,82 @@ def weather_cards(connection: duckdb.DuckDBPyConnection) -> str:
         for icon, label, value in cards
     )
     return (f"<div class='cards'>{body}</div>"
-            f"<p class='note'>Valores medidos {scope}. Atenção ao primeiro "
-            "cartão: a estação mede se está <b>caindo água no sensor</b> "
-            "naquele minuto, em um único ponto do circuito — não se a pista "
-            "está molhada. Para o estado da pista, veja a faixa azul no gráfico "
-            "de tempo de volta, na aba Resumo, que é lida dos pneus.</p>")
+            f"<p class='note'>Valores medidos {scope}.</p>")
+
+
+def weather_story(connection: duckdb.DuckDBPyConnection) -> str:
+    """The session's weather in sentences, written from the readings.
+
+    Each sentence exists only if its measurement does, so a still, dry,
+    uneventful afternoon produces a short paragraph instead of a long one
+    full of zeroes.
+    """
+    window = race_window(connection)
+    where = ""
+    if window:
+        where = f"WHERE session_time_seconds BETWEEN {window[0]} AND {window[1]}"
+    row = connection.execute(
+        f"""
+        SELECT min(track_temp_c), max(track_temp_c),
+               first(track_temp_c ORDER BY session_time_seconds),
+               last(track_temp_c ORDER BY session_time_seconds),
+               min(air_temp_c), max(air_temp_c),
+               min(humidity_pct), max(humidity_pct),
+               median(wind_speed_ms) * 3.6, max(wind_speed_ms) * 3.6,
+               median(wind_direction_deg),
+               coalesce(sum(is_raining::INT), 0), count(*),
+               coalesce(sum(track_temp_sensor_failed::INT), 0)
+        FROM silver_weather {where}
+        """
+    ).fetchone()
+    if not row or not row[12]:
+        return ""
+    (track_lo, track_hi, track_first, track_last, air_lo, air_hi, hum_lo,
+     hum_hi, wind_mid, wind_hi, wind_dir, rain, samples, failed) = row
+    scope = "Durante a corrida" if window else "Ao longo da sessão"
+
+    parts = []
+    if track_first is not None and track_last is not None:
+        direction = ("esfriou" if track_last < track_first - 1 else
+                     "esquentou" if track_last > track_first + 1 else
+                     "ficou estável")
+        parts.append(
+            f"{scope}, a pista {direction}: começou a {track_first:.0f} °C e "
+            f"terminou a {track_last:.0f} °C, variando entre {track_lo:.0f} e "
+            f"{track_hi:.0f} °C."
+        )
+    if air_lo is not None:
+        parts.append(f"O ar ficou entre {air_lo:.0f} e {air_hi:.0f} °C")
+        if hum_lo is not None:
+            parts[-1] += (f" e a umidade entre {hum_lo:.0f} e {hum_hi:.0f} %")
+        parts[-1] += "."
+    if rain:
+        parts.append(
+            f"A estação registrou água caindo no sensor em "
+            f"{plural(int(rain), 'minuto', 'minutos')} de {samples}. É um "
+            "ponto só do circuito: para saber se a pista estava molhada, a "
+            "faixa azul do gráfico de tempo de volta, lida dos pneus de "
+            "todo o grid, é a medida melhor."
+        )
+    else:
+        parts.append(
+            f"A estação não registrou água caindo no sensor em nenhum dos "
+            f"{samples} minutos medidos."
+        )
+    if wind_mid is not None:
+        parts.append(
+            f"O vento soprou de {COMPASS[int((wind_dir % 360) / 45 + 0.5) % 8]}, "
+            f"com mediana de {wind_mid:.0f} km/h e rajada máxima de "
+            f"{wind_hi:.0f} km/h."
+        )
+    if failed:
+        one = int(failed) == 1
+        parts.append(
+            f"{plural(int(failed), 'leitura', 'leituras')} do sensor da pista "
+            f"{'veio' if one else 'vieram'} como 0 °C e "
+            f"{'foi descartada' if one else 'foram descartadas'}."
+        )
+    return f"<p class='story'>{' '.join(parts)}</p>"
 
 
 def weather_chart(connection: duckdb.DuckDBPyConnection) -> str:
@@ -1018,7 +1142,7 @@ def weather_chart(connection: duckdb.DuckDBPyConnection) -> str:
             track_text = None
         hover = tip(
             moment,
-            "🌧️ Chovendo" if raining else "☁️ Sem chuva",
+            "🌧️ Água caindo no sensor" if raining else None,
             track_text,
             f"🌡️ Ar: {air:.1f} °C" if air is not None else None,
             f"💧 Umidade: {humidity:.0f} %" if humidity is not None else None,
@@ -1384,50 +1508,49 @@ def podium(connection: duckdb.DuckDBPyConnection) -> str:
 
 
 def summary_cards(connection: duckdb.DuckDBPyConnection) -> str:
-    total, usable = connection.execute(
-        "SELECT count(*), sum(is_representative::int) FROM gold_representative_laps"
-    ).fetchone()
-    wet, stints = connection.execute(
-        "SELECT sum(is_wet_compound::int), count(*) FROM gold_stint_pace"
-    ).fetchone()
+    """The race in cards. Fixed cards every race has; the rest earn their place.
+
+    A card reading "0 de 71 voltas com pista molhada" is a sentence about
+    the last race this code was written for, not about this one.
+    """
+    profile = session_profile(connection)
     fastest = connection.execute(
         "SELECT driver_code, lap_time_seconds FROM gold_fastest_lap"
     ).fetchone()
-    race_laps = connection.execute(
-        "SELECT max(laps_completed) FROM silver_results"
-    ).fetchone()[0]
-    wet_laps = (
-        connection.execute(
-            "SELECT sum(is_wet_track::int), count(*) FROM gold_track_state"
-        ).fetchone()
-        if has_table(connection, "gold_track_state")
-        else None
-    )
-    messages = (
-        connection.execute("SELECT count(*) FROM silver_race_control").fetchone()
-        if has_table(connection, "silver_race_control")
-        else None
-    )
 
     cards = []
+    laps = profile.get("race_laps") or profile.get("laps_run")
+    if laps:
+        cards.append(("🏁", "Distância", plural(int(laps), "volta", "voltas")))
     if fastest:
-        cards.append(("⚡", "Volta mais rápida", f"{fastest[0]} {fmt_lap(fastest[1])}"))
-    if race_laps:
-        cards.insert(0, ("🏁", "Distância da corrida",
-                         plural(int(race_laps), "volta", "voltas")))
-    if wet_laps and wet_laps[1]:
-        cards.append(("💦", "Voltas com pista molhada",
-                      f"{wet_laps[0] or 0} de {wet_laps[1]}"))
-    cards += [
-        ("🔁", "Voltas cronometradas, somando todos os pilotos",
-         f"{total:,}".replace(",", ".")),
-        ("✅", "Dessas, limpas (servem para medir ritmo)",
-         f"{usable or 0:,}".replace(",", ".")),
-        ("🛞", "Stints em pneu intermediário ou de chuva",
-         f"{wet or 0} de {stints}"),
-    ]
-    if messages:
-        cards.append(("📻", "Mensagens da direção de prova", f"{messages[0]:,}".replace(",", ".")))
+        cards.append(("⚡", "Volta mais rápida",
+                      f"{fastest[0]} {fmt_lap(fastest[1])}"))
+    margin, down = (profile.get("winning_margin_seconds"),
+                    profile.get("runner_up_laps_down"))
+    if margin is not None:
+        cards.append(("⏱️", "Margem da vitória", f"{margin:.3f} s"))
+    elif down:
+        cards.append(("⏱️", "Margem da vitória",
+                      plural(int(down), "volta", "voltas")))
+    if profile.get("lead_changes") is not None:
+        cards.append(("🔄", "Trocas de liderança", f"{profile['lead_changes']}"))
+    if profile.get("biggest_gainer") and (profile.get("biggest_gain") or 0) > 0:
+        cards.append(("📈", "Quem mais subiu",
+                      f"{profile['biggest_gainer']} +{int(profile['biggest_gain'])}"))
+    if profile.get("pit_stops"):
+        cards.append(("🔧", "Paradas nos boxes", f"{int(profile['pit_stops'])}"))
+
+    # Conditional: these only exist on the page when they happened on track.
+    counted = profile.get("counted_laps") or 0
+    for key, icon, label in (
+        ("wet_laps", "💦", "Voltas com pista molhada"),
+        ("safety_car_laps", "🚨", "Voltas com safety car"),
+        ("vsc_laps", "🟠", "Voltas com safety car virtual"),
+        ("red_flag_laps", "🟥", "Voltas com bandeira vermelha"),
+    ):
+        value = profile.get(key) or 0
+        if value:
+            cards.append((icon, label, f"{int(value)} de {counted}"))
 
     return "<div class='cards'>" + "".join(
         f"<div class='card'><span class='card-icon'>{icon}</span>"
@@ -1435,6 +1558,19 @@ def summary_cards(connection: duckdb.DuckDBPyConnection) -> str:
         f"<span class='card-label'>{esc(label)}</span></div>"
         for icon, label, value in cards
     ) + "</div>"
+
+
+def lap_count_note(connection: duckdb.DuckDBPyConnection) -> str:
+    """How many laps the page is built on. Data quality, not a race fact."""
+    total, usable = connection.execute(
+        "SELECT count(*), sum(is_representative::int) FROM gold_representative_laps"
+    ).fetchone()
+    if not total:
+        return ""
+    both = (f"{total:,}".replace(",", "."), f"{usable or 0:,}".replace(",", "."))
+    return (f"<p class='count'>Somando todos os pilotos, a sessão tem "
+            f"<b>{both[0]}</b> voltas cronometradas, das quais "
+            f"<b>{both[1]}</b> são limpas e entram nas medidas de ritmo.</p>")
 
 
 # Tabs that only make sense when their source table was loaded. The body is
@@ -1446,17 +1582,25 @@ HOVER_HINT = "<span class='hint'>🖱️ Passe o mouse para ver os detalhes.</sp
 
 
 def tab_summary(connection: duckdb.DuckDBPyConnection) -> str:
+    _state, bands = track_condition(connection)
+    strips = {
+        "wet": "A faixa azul embaixo mostra quanto do grid estava em pneu "
+               "intermediário ou de chuva em cada volta: é o estado da pista "
+               "lido dos pneus.",
+        "neutralisation": "A faixa de baixo marca as voltas em que a corrida "
+                          "esteve neutralizada, na cor da bandeira.",
+    }
+    condition_note = " ".join(strips[band] for band in bands)
     return f"""{podium(connection)}
 {summary_cards(connection)}
 <h2>Tempo de volta ao longo da corrida</h2>
 <p class="note">Um ponto por volta, na cor do composto. Ficam de fora voltas
 sob bandeira amarela, voltas deletadas e voltas de entrada ou saída do box:
 nenhuma delas se compara com uma volta limpa. {HOVER_HINT} Parar sobre um ponto
-destaca todas as voltas daquele piloto. A faixa azul embaixo mostra o estado da
-pista: quanto mais escura, maior a parte do grid em pneu intermediário ou de
-chuva naquela volta.</p>
+destaca todas as voltas daquele piloto. {condition_note}</p>
 {lap_time_chart(connection)}
 {compound_legend(connection)}
+{lap_count_note(connection)}
 <h2>Classificação</h2>
 <p class="note">Reconstruída a partir da cronometragem bruta e conferida com o
 resultado publicado pela FIA. Linhas em cinza não foram classificadas.</p>
@@ -1478,6 +1622,12 @@ barra é a quantidade de voltas. {HOVER_HINT}</p>
 
 
 def tab_pace(connection: duckdb.DuckDBPyConnection) -> str:
+    scales = connection.execute(
+        "SELECT count(DISTINCT is_wet_compound) FROM gold_stint_pace "
+        "WHERE median_pace_seconds IS NOT NULL"
+    ).fetchone()[0]
+    split = ("Seco e molhado ficam em escalas separadas, porque não se "
+             "comparam. " if scales > 1 else "")
     return f"""<h2>Diferença para o companheiro de equipe</h2>
 <p class="note">A única comparação em que o carro é o mesmo. A barra mostra
 quanto o piloto da esquerda foi mais rápido por volta, na mediana das voltas
@@ -1486,8 +1636,7 @@ limpas. Quando um dos dois completou bem menos voltas, a dupla aparece como
 {teammate_chart(connection)}
 <h2>Ritmo por stint</h2>
 <p class="note">Cada bolinha é um stint, posicionada pelo ritmo mediano e
-colorida pelo composto; quanto maior, mais voltas limpas. Seco e molhado ficam
-em escalas separadas, porque não se comparam. {HOVER_HINT} A "tendência" é
+colorida pelo composto; quanto maior, mais voltas limpas. {split}{HOVER_HINT} A "tendência" é
 quanto o tempo de volta mudou a cada volta do stint — ela mistura desgaste de
 pneu, queima de combustível e evolução da pista, por isso não chamamos de
 degradação.</p>
@@ -1524,7 +1673,8 @@ outras mostram quantos km/h ficaram abaixo dele.</p>
 
 
 def tab_weather(connection: duckdb.DuckDBPyConnection) -> str:
-    return f"""<h2>Clima</h2>
+    return f"""<h2>A história do clima</h2>
+{weather_story(connection)}
 {weather_cards(connection)}
 <h2>Linha do tempo</h2>
 <p class="note">Uma leitura por minuto, do início da sessão ao fim. A faixa
@@ -1532,8 +1682,7 @@ clara é a corrida e as faixas azuis são os minutos em que o sensor registrou
 chuva caindo. O anel vermelho marca uma leitura em que o sensor da pista
 informou exatamente 0&nbsp;°C — isso é falha do sensor, não temperatura, e o
 valor é guardado como nulo.
-{HOVER_HINT} O desenho da pista entra aqui quando ingerirmos os dados de
-posição dos carros.</p>
+{HOVER_HINT}</p>
 {weather_chart(connection)}"""
 
 
@@ -1661,14 +1810,17 @@ main { max-width: 1040px; margin: 0 auto; }
 h1 { font-size: 26px; margin: 0 0 3px; letter-spacing: -0.015em; }
 h2 { font-size: 17px; margin: 34px 0 5px; letter-spacing: -0.01em; }
 p.sub { margin: 0 0 18px; color: #6b6b68; }
+p.story { margin: 3px 0 15px; font-size: 15px; max-width: 86ch;
+          color: #33332f; }
 p.note { margin: 3px 0 13px; color: #6b6b68; font-size: 13.5px; max-width: 86ch; }
 p.warn { margin: 3px 0 14px; padding: 11px 13px; background: #fff8e8;
          border: 1px solid #f0dfae; border-radius: 8px; font-size: 13.5px;
          color: #5c4a12; max-width: 92ch; }
 .hint { color: #1d4ed8; white-space: nowrap; }
 code { background: #f1f1ed; padding: 1px 4px; border-radius: 3px; font-size: 92%; }
-.cards { display: flex; flex-wrap: wrap; gap: 9px; margin: 4px 0 6px; }
-.card { flex: 1 1 140px; background: #fff; border: 1px solid #e8e8e4;
+.cards { display: grid; gap: 9px; margin: 4px 0 6px;
+         grid-template-columns: repeat(auto-fill, minmax(158px, 1fr)); }
+.card { background: #fff; border: 1px solid #e8e8e4;
         border-radius: 10px; padding: 11px 13px; }
 .card-icon { display: block; font-size: 19px; line-height: 1.1; margin-bottom: 3px; }
 .card-value { display: block; font-size: 18px; font-weight: 650; }

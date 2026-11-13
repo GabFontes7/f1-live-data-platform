@@ -237,20 +237,41 @@ WET_COMPOUNDS = ("INTERMEDIATE", "WET")
 # it are running a wet-weather compound.
 WET_TRACK_SHARE = 0.5
 
+# TrackStatus is a concatenation of every code seen during the lap: 1 clear,
+# 2 yellow, 4 safety car, 5 red flag, 6 virtual safety car, 7 VSC ending. A
+# lap is neutralised if ANY car saw the code, because the neutralisation is
+# a property of the track rather than of a car.
 GOLD_TRACK_STATE = f"""
 CREATE OR REPLACE TABLE gold_track_state AS
+WITH per_lap AS (
+    SELECT
+        session_slug,
+        lap_number,
+        count(*)                                       AS cars_on_track,
+        count(compound)                                AS cars_with_a_compound,
+        sum((compound IN {WET_COMPOUNDS})::INT)        AS cars_on_wet_tyres,
+        bool_or(contains(track_status, '5'))           AS had_red_flag,
+        bool_or(contains(track_status, '4'))           AS had_safety_car,
+        bool_or(contains(track_status, '6')
+                OR contains(track_status, '7'))        AS had_virtual_safety_car,
+        bool_or(contains(track_status, '2'))           AS had_yellow
+    FROM silver_laps
+    GROUP BY session_slug, lap_number
+)
 SELECT
-    session_slug,
-    lap_number,
-    count(*)                                          AS cars_on_track,
-    sum((compound IN {WET_COMPOUNDS})::INT)           AS cars_on_wet_tyres,
-    sum((compound IN {WET_COMPOUNDS})::INT)::DOUBLE
-        / count(*)                                    AS wet_tyre_share,
-    sum((compound IN {WET_COMPOUNDS})::INT)::DOUBLE
-        / count(*) >= {WET_TRACK_SHARE}               AS is_wet_track
-FROM silver_laps
-WHERE compound IS NOT NULL
-GROUP BY session_slug, lap_number
+    * EXCLUDE (cars_with_a_compound),
+    CASE WHEN cars_with_a_compound > 0
+         THEN cars_on_wet_tyres::DOUBLE / cars_with_a_compound END
+                                                       AS wet_tyre_share,
+    coalesce(cars_on_wet_tyres::DOUBLE
+             / nullif(cars_with_a_compound, 0) >= {WET_TRACK_SHARE}, FALSE)
+                                                       AS is_wet_track,
+    CASE WHEN had_red_flag             THEN 'red'
+         WHEN had_safety_car           THEN 'safety_car'
+         WHEN had_virtual_safety_car   THEN 'vsc'
+         WHEN had_yellow               THEN 'yellow'
+         ELSE 'green' END                              AS neutralisation
+FROM per_lap
 ORDER BY lap_number
 """
 """Why the track's state is read from the tyres, not from the weather feed.
@@ -266,6 +287,62 @@ intermediates on a dry track or on slicks on a wet one for long. So a lap
 counts as wet when at least half the cars on it are on a wet-weather
 compound, and the share itself is kept, because the laps where it moves
 from 1 to 0 are the crossover -- the most interesting laps of the race.
+"""
+
+# What actually happened in this session, in one row. The report reads it to
+# decide which sections have anything to say: a card about rain belongs on a
+# page about a wet race and nowhere else.
+GOLD_SESSION_PROFILE = """
+CREATE OR REPLACE TABLE gold_session_profile AS
+WITH leaders AS (
+    SELECT lap_number, any_value(driver_code) AS leader
+    FROM silver_laps WHERE position = 1
+    GROUP BY lap_number
+),
+changes AS (
+    SELECT count(*) AS lead_changes FROM (
+        SELECT leader, lag(leader) OVER (ORDER BY lap_number) AS previous
+        FROM leaders
+    ) WHERE previous IS NOT NULL AND leader IS DISTINCT FROM previous
+),
+laps AS (
+    SELECT
+        any_value(session_slug)                   AS session_slug,
+        max(lap_number)                           AS laps_run,
+        count(DISTINCT driver_code)               AS cars_with_laps,
+        sum(is_in_lap::INT)                       AS pit_stops,
+        sum(is_deleted::INT)                      AS deleted_laps,
+        count(DISTINCT compound)                  AS compounds_used
+    FROM silver_laps
+),
+state AS (
+    SELECT
+        sum(is_wet_track::INT)                            AS wet_laps,
+        sum((neutralisation = 'safety_car')::INT)         AS safety_car_laps,
+        sum((neutralisation = 'vsc')::INT)                AS vsc_laps,
+        sum((neutralisation = 'red')::INT)                AS red_flag_laps,
+        sum((neutralisation = 'yellow')::INT)             AS yellow_laps,
+        count(*)                                          AS counted_laps
+    FROM gold_track_state
+),
+result AS (
+    SELECT
+        max(laps_completed)                       AS race_laps,
+        count(*)                                  AS entries,
+        sum(is_classified::INT)                   AS classified,
+        max(positions_gained)                     AS biggest_gain,
+        arg_max(driver_code, positions_gained)    AS biggest_gainer,
+        arg_min(driver_code, finishing_order)     AS winner
+    FROM gold_race_classification
+),
+margin AS (
+    SELECT gap_to_winner_seconds AS winning_margin_seconds, laps_down AS runner_up_laps_down
+    FROM gold_race_classification WHERE finishing_order = 2
+)
+SELECT laps.*, result.*, state.*, changes.lead_changes,
+       margin.winning_margin_seconds, margin.runner_up_laps_down
+FROM laps, result, state, changes
+LEFT JOIN margin ON TRUE
 """
 
 # Two medians are comparable only when both drivers ran a similar share of
@@ -433,6 +510,7 @@ def build(
         connection.execute(GOLD_STINT_PACE)
         connection.execute(GOLD_TRACK_STATE)
         connection.execute(GOLD_TEAMMATE_DELTA)
+        connection.execute(GOLD_SESSION_PROFILE)
 
         for table in (
             "silver_results",
@@ -442,6 +520,7 @@ def build(
             "gold_representative_laps",
             "gold_stint_pace",
             "gold_track_state",
+            "gold_session_profile",
             "gold_teammate_delta",
             *loaded_optional,
         ):
