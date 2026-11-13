@@ -48,13 +48,25 @@ def test_an_unclassified_driver_is_marked(page):
 
 
 def test_the_lap_chart_plots_every_representative_lap(rendered):
-    """The invariant, not a magic number: one dot per usable lap."""
-    page, connection = rendered
+    """The invariant, not a magic number: one dot per usable lap.
+
+    Counted on the chart itself rather than the page, because other charts
+    draw circles too -- the speed chart marks each driver's median with one.
+    """
+    _page, connection = rendered
     usable = connection.execute(
         "SELECT sum(is_representative::int) FROM gold_representative_laps"
     ).fetchone()[0]
 
-    assert page.count("<circle") == usable
+    assert report.lap_time_chart(connection).count("<circle") == usable
+
+
+def test_an_optional_tab_is_dropped_when_its_table_is_absent(rendered):
+    """A session without weather data gets no weather tab, not an empty one."""
+    page, _connection = rendered
+
+    assert "id='panel-weather'" not in page
+    assert "id='panel-summary'" in page
 
 
 def test_compound_colours_follow_the_television_convention(page):

@@ -25,14 +25,54 @@ def write_bronze(tmp_path, results: pd.DataFrame, laps: pd.DataFrame):
     return tmp_path
 
 
+def lap(driver, number, seconds, *, status="1", deleted=False,
+        pit_in=None, pit_out=None, compound="SOFT", tyre_life=None,
+        position=None, stint=1):
+    """One lap row carrying every column the silver layer reads."""
+    return {
+        "Driver": driver,
+        "DriverNumber": "1",
+        "Team": "Alpha",
+        "LapNumber": float(number),
+        "LapTime": seconds,
+        "Time": float(number) * 90.0,
+        "LapStartTime": float(number) * 90.0 - seconds,
+        "Position": float(position if position is not None else 1),
+        "Stint": float(stint),
+        "Compound": compound,
+        "TyreLife": float(tyre_life if tyre_life is not None else number),
+        "FreshTyre": False,
+        "Sector1Time": seconds / 3,
+        "Sector2Time": seconds / 3,
+        "Sector3Time": seconds / 3,
+        "SpeedI1": 250.0,
+        "SpeedI2": 260.0,
+        "SpeedFL": 270.0,
+        "SpeedST": 300.0,
+        "IsPersonalBest": False,
+        "TrackStatus": status,
+        "Deleted": deleted,
+        "DeletedReason": "track limits" if deleted else "",
+        "IsAccurate": True,
+        "FastF1Generated": False,
+        "PitInTime": pit_in,
+        "PitOutTime": pit_out,
+    }
+
+
 def make_results() -> pd.DataFrame:
     """Three drivers: a winner, a lapped finisher, and a retirement."""
     return pd.DataFrame(
         {
             "DriverNumber": ["1", "2", "3"],
             "Abbreviation": ["WIN", "LAP", "OUT"],
+            "BroadcastName": ["W ONE", "L TWO", "O THREE"],
+            "DriverId": ["one", "two", "three"],
+            "CountryCode": ["BRA", "BRA", "BRA"],
             "FullName": ["Winner One", "Lapped Two", "Out Three"],
             "TeamName": ["Alpha", "Beta", "Gamma"],
+            "TeamColor": ["FF0000", "00FF00", "0000FF"],
+            "TeamId": ["alpha", "beta", "gamma"],
             "Position": [1.0, 2.0, 3.0],
             "ClassifiedPosition": ["1", "2", "R"],
             "GridPosition": [3.0, 1.0, 2.0],
@@ -47,21 +87,13 @@ def make_results() -> pd.DataFrame:
 def make_laps() -> pd.DataFrame:
     """A legal quick lap, a quicker deleted one, and a quicker unclassified one."""
     return pd.DataFrame(
-        {
-            "Driver": ["WIN", "LAP", "OUT", "WIN"],
-            "LapNumber": [10.0, 11.0, 12.0, 13.0],
-            "LapTime": [72.689, 70.100, 69.000, 75.000],
-            "Stint": [1.0, 1.0, 1.0, 2.0],
-            "Compound": ["MEDIUM", "SOFT", "SOFT", "HARD"],
-            "TyreLife": [5.0, 6.0, 7.0, 1.0],
-            "FreshTyre": [False, False, True, True],
-            "TrackStatus": ["1", "1", "1", "4"],
-            "Deleted": [False, True, False, False],
-            "DeletedReason": ["", "track limits", "", ""],
-            "IsAccurate": [True, True, True, False],
-            "PitInTime": [None, None, None, 1234.0],
-            "PitOutTime": [None, None, None, None],
-        }
+        [
+            lap("WIN", 10, 72.689, compound="MEDIUM", tyre_life=5),
+            lap("LAP", 11, 70.100, deleted=True, tyre_life=6),
+            lap("OUT", 12, 69.000, tyre_life=7),
+            lap("WIN", 13, 75.000, status="4", pit_in=1234.0, compound="HARD",
+                tyre_life=1),
+        ]
     )
 
 
@@ -175,8 +207,13 @@ def make_pace_results() -> pd.DataFrame:
         {
             "DriverNumber": ["1", "2", "3"],
             "Abbreviation": ["FST", "SLW", "DNF"],
+            "BroadcastName": ["F ONE", "S TWO", "D THREE"],
+            "DriverId": ["fst", "slw", "dnf"],
+            "CountryCode": ["BRA", "BRA", "BRA"],
             "FullName": ["Fast One", "Slow Two", "Broken Three"],
             "TeamName": ["Alpha", "Alpha", "Beta"],
+            "TeamColor": ["FF0000", "FF0000", "0000FF"],
+            "TeamId": ["alpha", "alpha", "beta"],
             "Position": [1.0, 2.0, 3.0],
             "ClassifiedPosition": ["1", "2", "R"],
             "GridPosition": [1.0, 2.0, 3.0],
@@ -188,25 +225,6 @@ def make_pace_results() -> pd.DataFrame:
             "Time": [900.0, 5.0, None],
         }
     )
-
-
-def lap(driver, number, seconds, *, status="1", deleted=False,
-        pit_in=None, pit_out=None, compound="SOFT", tyre_life=None):
-    return {
-        "Driver": driver,
-        "LapNumber": float(number),
-        "LapTime": seconds,
-        "Stint": 1.0,
-        "Compound": compound,
-        "TyreLife": float(tyre_life if tyre_life is not None else number),
-        "FreshTyre": False,
-        "TrackStatus": status,
-        "Deleted": deleted,
-        "DeletedReason": "track limits" if deleted else "",
-        "IsAccurate": True,
-        "PitInTime": pit_in,
-        "PitOutTime": pit_out,
-    }
 
 
 @pytest.fixture

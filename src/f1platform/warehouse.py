@@ -55,6 +55,11 @@ SELECT
     "ClassifiedPosition"                   AS classified_position,
     CAST("GridPosition" AS INTEGER)        AS grid_position,
     "Status"                               AS status,
+    "TeamColor"                            AS team_colour,
+    "TeamId"                               AS team_id,
+    "DriverId"                             AS driver_id,
+    "BroadcastName"                        AS broadcast_name,
+    "CountryCode"                          AS country_code,
     CAST("Points" AS DOUBLE)               AS points,
     CAST("Laps" AS INTEGER)                AS laps_completed,
     CAST("Time" AS DOUBLE)                 AS time_seconds,
@@ -67,18 +72,78 @@ CREATE OR REPLACE TABLE silver_laps AS
 SELECT
     ? AS session_slug,
     "Driver"                        AS driver_code,
+    CAST("DriverNumber" AS VARCHAR) AS driver_number,
+    "Team"                          AS team_name,
     CAST("LapNumber" AS INTEGER)    AS lap_number,
     CAST("LapTime" AS DOUBLE)       AS lap_time_seconds,
+    CAST("Time" AS DOUBLE)          AS session_time_seconds,
+    CAST("LapStartTime" AS DOUBLE)  AS lap_start_seconds,
+    CAST("Position" AS INTEGER)     AS position,
     CAST("Stint" AS INTEGER)        AS stint,
     "Compound"                      AS compound,
     CAST("TyreLife" AS DOUBLE)      AS tyre_life,
     "FreshTyre"                     AS fresh_tyre,
+    CAST("Sector1Time" AS DOUBLE)   AS sector1_seconds,
+    CAST("Sector2Time" AS DOUBLE)   AS sector2_seconds,
+    CAST("Sector3Time" AS DOUBLE)   AS sector3_seconds,
+    CAST("SpeedI1" AS DOUBLE)       AS speed_i1_kph,
+    CAST("SpeedI2" AS DOUBLE)       AS speed_i2_kph,
+    CAST("SpeedFL" AS DOUBLE)       AS speed_finish_kph,
+    CAST("SpeedST" AS DOUBLE)       AS speed_trap_kph,
+    "IsPersonalBest"                AS is_personal_best,
     "TrackStatus"                   AS track_status,
     "Deleted"                       AS is_deleted,
     "DeletedReason"                 AS deleted_reason,
     "IsAccurate"                    AS is_accurate,
+    "FastF1Generated"               AS is_reconstructed,
     "PitInTime" IS NOT NULL         AS is_in_lap,
-    "PitOutTime" IS NOT NULL        AS is_out_lap
+    "PitOutTime" IS NOT NULL        AS is_out_lap,
+    CAST("PitInTime" AS DOUBLE)     AS pit_in_seconds,
+    CAST("PitOutTime" AS DOUBLE)    AS pit_out_seconds
+FROM read_parquet(?)
+"""
+
+# A track-temperature sensor that reports 0 C at Interlagos is not reporting
+# a temperature. One sample of 160 in the Sao Paulo race reads exactly 0.0,
+# and the readings taken while it was raining swing by 15 C between
+# consecutive minutes. Zero becomes NULL; the swings are left alone and
+# flagged, because they are noisy measurements rather than absent ones.
+SILVER_WEATHER = """
+CREATE OR REPLACE TABLE silver_weather AS
+SELECT
+    ? AS session_slug,
+    CAST("Time" AS DOUBLE)                      AS session_time_seconds,
+    CAST("AirTemp" AS DOUBLE)                   AS air_temp_c,
+    CASE WHEN "TrackTemp" > 0
+         THEN CAST("TrackTemp" AS DOUBLE) END   AS track_temp_c,
+    CAST("TrackTemp" AS DOUBLE) = 0             AS track_temp_sensor_failed,
+    CAST("Humidity" AS DOUBLE)                  AS humidity_pct,
+    CAST("Pressure" AS DOUBLE)                  AS pressure_mbar,
+    "Rainfall"                                  AS is_raining,
+    CAST("WindSpeed" AS DOUBLE)                 AS wind_speed_ms,
+    CAST("WindDirection" AS INTEGER)            AS wind_direction_deg
+FROM read_parquet(?)
+"""
+
+# Race control carries two different things under one feed: flags, which are
+# track state, and "Other", which is the stewards talking. Penalties served
+# during the race appear here; penalties applied after the chequered flag do
+# not, because they live in the FIA's documents instead.
+SILVER_RACE_CONTROL = """
+CREATE OR REPLACE TABLE silver_race_control AS
+SELECT
+    ? AS session_slug,
+    CAST("Lap" AS INTEGER)              AS lap_number,
+    CAST("Time" AS TIMESTAMP)           AS message_time,
+    "Category"                          AS category,
+    "Message"                           AS message,
+    "Flag"                              AS flag,
+    "Scope"                             AS scope,
+    CAST("Sector" AS INTEGER)           AS sector,
+    CAST("RacingNumber" AS VARCHAR)     AS driver_number,
+    regexp_matches("Message", 'TIME PENALTY')      AS mentions_penalty,
+    regexp_matches("Message", 'INVESTIGAT')        AS mentions_investigation,
+    regexp_matches("Message", 'DELETED')           AS mentions_deleted_lap
 FROM read_parquet(?)
 """
 
@@ -303,11 +368,28 @@ def build(
                 f"{required} is missing -- run f1-ingest for {session_slug} first"
             )
 
+    # Weather and race control are not guaranteed: a session can lack either.
+    optional = {
+        "silver_weather": (SILVER_WEATHER, session_dir / "weather_data.parquet"),
+        "silver_race_control": (
+            SILVER_RACE_CONTROL,
+            session_dir / "race_control_messages.parquet",
+        ),
+    }
+
     db_path.parent.mkdir(parents=True, exist_ok=True)
     connection = duckdb.connect(str(db_path))
     try:
         connection.execute(SILVER_RESULTS, [session_slug, str(results_parquet)])
         connection.execute(SILVER_LAPS, [session_slug, str(laps_parquet)])
+
+        loaded_optional = []
+        for name, (sql, path) in optional.items():
+            if path.exists():
+                connection.execute(sql, [session_slug, str(path)])
+                loaded_optional.append(name)
+            else:
+                LOGGER.warning("%s is absent, skipping %s", path.name, name)
         connection.execute(GOLD_CLASSIFICATION)
         connection.execute(GOLD_FASTEST_LAP)
         connection.execute(GOLD_REPRESENTATIVE_LAPS)
@@ -322,6 +404,7 @@ def build(
             "gold_representative_laps",
             "gold_stint_pace",
             "gold_teammate_delta",
+            *loaded_optional,
         ):
             rows = connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
             LOGGER.info("%s: %s rows", table, f"{rows:,}")

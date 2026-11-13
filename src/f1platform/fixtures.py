@@ -42,13 +42,25 @@ DROP_COLUMNS = frozenset({"HeadshotUrl"})
 # empty gold table weeks later.
 REQUIRED_COLUMNS = {
     "results": (
-        "DriverNumber", "Abbreviation", "FullName", "TeamName", "Position",
+        "DriverNumber", "Abbreviation", "BroadcastName", "DriverId", "FullName",
+        "TeamName", "TeamColor", "TeamId", "CountryCode", "Position",
         "ClassifiedPosition", "GridPosition", "Status", "Points", "Laps", "Time",
     ),
     "laps": (
-        "Driver", "LapNumber", "LapTime", "Stint", "Compound", "TyreLife",
-        "FreshTyre", "TrackStatus", "Deleted", "DeletedReason", "IsAccurate",
-        "PitInTime", "PitOutTime",
+        "Driver", "DriverNumber", "Team", "LapNumber", "LapTime", "Time",
+        "LapStartTime", "Position", "Stint", "Compound", "TyreLife", "FreshTyre",
+        "Sector1Time", "Sector2Time", "Sector3Time", "SpeedI1", "SpeedI2",
+        "SpeedFL", "SpeedST", "IsPersonalBest", "TrackStatus", "Deleted",
+        "DeletedReason", "IsAccurate", "FastF1Generated", "PitInTime",
+        "PitOutTime",
+    ),
+    "weather_data": (
+        "Time", "AirTemp", "TrackTemp", "Humidity", "Pressure", "Rainfall",
+        "WindSpeed", "WindDirection",
+    ),
+    "race_control_messages": (
+        "Lap", "Time", "Category", "Message", "Flag", "Scope", "Sector",
+        "RacingNumber",
     ),
 }
 

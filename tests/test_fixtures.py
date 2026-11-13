@@ -44,13 +44,21 @@ def test_a_source_that_lost_a_required_column_is_refused():
         fx.prepare(frame, "laps")
 
 
-def test_a_table_with_no_required_columns_is_kept_whole():
-    """Weather has no checklist; every column it brings is exported."""
+def test_a_table_outside_the_checklist_is_kept_whole():
+    """An unknown table has nothing to check, so everything it brings is kept."""
+    frame = pd.DataFrame({"Whatever": [1], "Else": [2]})
+
+    prepared = fx.prepare(frame, "some_future_table")
+
+    assert list(prepared.columns) == ["Whatever", "Else"]
+
+
+def test_weather_is_checked_too():
+    """Every table the warehouse reads carries a checklist, weather included."""
     frame = pd.DataFrame({"AirTemp": [22.0], "Rainfall": [True]})
 
-    prepared = fx.prepare(frame, "weather_data")
-
-    assert list(prepared.columns) == ["AirTemp", "Rainfall"]
+    with pytest.raises(fx.MissingColumnsError, match="TrackTemp"):
+        fx.prepare(frame, "weather_data")
 
 
 def test_a_missing_bronze_session_is_refused(tmp_path):
