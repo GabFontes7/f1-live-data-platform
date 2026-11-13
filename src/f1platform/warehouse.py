@@ -101,10 +101,21 @@ SELECT
     status,
     points,
     laps_completed,
-    -- The winner's `Time` is the race duration; everyone else's is a gap.
+    -- How many whole laps behind the winner. Only meaningful for a
+    -- classified driver: a retirement is not "41 laps down", it is out.
+    CASE WHEN is_classified
+         THEN max(laps_completed) OVER () - laps_completed END AS laps_down,
+    -- The winner's `Time` is the race duration.
     CASE WHEN finishing_order = 1 THEN time_seconds END AS race_duration_seconds,
-    CASE WHEN finishing_order > 1 AND status = 'Finished' THEN time_seconds END
-        AS gap_to_winner_seconds
+    -- For everyone else `Time` is the time behind the leader with whole laps
+    -- taken out, which is why it restarts low at the top of each lap group:
+    -- in Sao Paulo, Bearman a lap down reads 91.7s and Perez two laps down
+    -- reads 27.1s. Kept under a name that says what it is.
+    CASE WHEN finishing_order > 1 THEN time_seconds END AS time_behind_seconds,
+    -- A true gap to the winner exists only on the lead lap.
+    CASE WHEN finishing_order > 1
+          AND max(laps_completed) OVER () - laps_completed = 0
+         THEN time_seconds END AS gap_to_winner_seconds
 FROM silver_results
 ORDER BY finishing_order
 """

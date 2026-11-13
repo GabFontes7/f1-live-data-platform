@@ -202,7 +202,8 @@ def classification_table(connection: duckdb.DuckDBPyConnection) -> str:
         """
         SELECT classified_position, driver_code, driver_name, team_name,
                status, points, laps_completed, gap_to_winner_seconds,
-               race_duration_seconds, is_classified
+               race_duration_seconds, is_classified, laps_down,
+               time_behind_seconds
         FROM gold_race_classification
         ORDER BY finishing_order
         """
@@ -210,13 +211,23 @@ def classification_table(connection: duckdb.DuckDBPyConnection) -> str:
 
     body = []
     for (position, code, name, team, status, points, laps, gap,
-         duration, is_classified) in rows:
+         duration, is_classified, laps_down, behind) in rows:
         if duration is not None:
             minutes, seconds = divmod(duration, 60)
             hours, minutes = divmod(int(minutes), 60)
             time_cell = f"{hours}:{minutes:02d}:{seconds:06.3f}"
         elif gap is not None:
             time_cell = f"+{gap:.3f}"
+        elif laps_down:
+            # Shown the way the timing screens show it: the lap difference
+            # first, then the time behind within that lap.
+            plural = "s" if laps_down > 1 else ""
+            trailing = (
+                f" <span class='muted-cell'>+{behind:.3f}</span>"
+                if behind is not None
+                else ""
+            )
+            time_cell = f"+{int(laps_down)} lap{plural}{trailing}"
         else:
             time_cell = "—"
         row_class = "" if is_classified else " class='unclassified'"
@@ -300,6 +311,7 @@ tr:last-child td { border-bottom: none; }
 td.num { text-align: right; font-variant-numeric: tabular-nums; }
 td.pos { font-weight: 650; width: 44px; }
 tr.unclassified td { color: #9a9a93; }
+.muted-cell { color: #9a9a93; font-size: 12px; }
 footer { margin-top: 46px; padding-top: 16px; border-top: 1px solid #e8e8e4;
          color: #85857f; font-size: 12.5px; }
 .empty { color: #85857f; font-style: italic; }

@@ -82,5 +82,12 @@ def test_a_missing_warehouse_is_refused(tmp_path):
         report.build_report(SESSION, tmp_path / "absent.duckdb", tmp_path)
 
 
+def test_a_lapped_driver_shows_the_lap_deficit(rendered):
+    """The screens say "+1 lap", not a blank cell."""
+    page, _ = rendered
+
+    assert "+1 lap" in page
+
+
 def test_driver_names_are_escaped(page):
     assert "<script>" not in page

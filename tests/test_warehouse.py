@@ -113,6 +113,37 @@ def test_only_the_winner_keeps_a_race_duration(built):
     assert rows[1][2] is None, "and a lapped driver's Time is not a gap"
 
 
+def test_a_lapped_driver_keeps_his_lap_deficit(built):
+    """Hiding the number loses information; naming it honestly does not."""
+    down, gap, behind = built.execute(
+        """
+        SELECT laps_down, gap_to_winner_seconds, time_behind_seconds
+        FROM gold_race_classification WHERE driver_code = 'LAP'
+        """
+    ).fetchone()
+
+    assert down == 1, "one lap behind the winner"
+    assert gap is None, "a true gap to the winner exists only on the lead lap"
+    assert behind == pytest.approx(4.427), "time behind, with whole laps taken out"
+
+
+def test_an_unclassified_driver_has_no_lap_deficit(built):
+    """A retirement is not 59 laps down, it is out."""
+    down = built.execute(
+        "SELECT laps_down FROM gold_race_classification WHERE driver_code = 'OUT'"
+    ).fetchone()[0]
+
+    assert down is None
+
+
+def test_the_winner_is_zero_laps_down(built):
+    down = built.execute(
+        "SELECT laps_down FROM gold_race_classification WHERE driver_code = 'WIN'"
+    ).fetchone()[0]
+
+    assert down == 0
+
+
 def test_positions_gained_uses_the_grid(built):
     gained = built.execute(
         "SELECT positions_gained FROM gold_race_classification "
@@ -149,9 +180,11 @@ def make_pace_results() -> pd.DataFrame:
             "Position": [1.0, 2.0, 3.0],
             "ClassifiedPosition": ["1", "2", "R"],
             "GridPosition": [1.0, 2.0, 3.0],
-            "Status": ["Finished", "Finished", "Retired"],
+            # The slower teammate finishes a lap down, so the report has a
+            # lap deficit to render and the delta still has two full stints.
+            "Status": ["Finished", "Lapped", "Retired"],
             "Points": [25.0, 18.0, 0.0],
-            "Laps": [10.0, 10.0, 2.0],
+            "Laps": [10.0, 9.0, 2.0],
             "Time": [900.0, 5.0, None],
         }
     )
