@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal
 import sys
 import time
@@ -23,6 +24,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 
 from fastf1.livetiming.client import SignalRClient
@@ -99,7 +101,43 @@ def interrupt_guard():
         signal.signal(signal.SIGINT, previous)
 
 
-def record_once(path: Path, idle_timeout: int) -> None:
+def check_auth() -> bool:
+    """Sign in to the F1 account now and report whether it worked.
+
+    The feed requires a (free) Formula 1 account. Finding that out while a
+    session is running is too late, so this runs the sign-in on demand, days
+    early. FastF1 stores the resulting token on disk and reuses it, which is
+    why a reconnect mid-session does not prompt again.
+
+    Credentials come from the environment variables ``F1_USERNAME`` and
+    ``F1_PASSWORD``; without them an interactive terminal is prompted.
+    """
+    try:
+        from fastf1.internals.f1account import get_token
+    except ImportError as error:
+        LOGGER.error(
+            "this FastF1 version does not expose the account helper (%s); "
+            "sign-in behaviour has changed and the recorder needs updating",
+            error,
+        )
+        return False
+
+    if os.environ.get("F1_USERNAME"):
+        LOGGER.info("using credentials from F1_USERNAME / F1_PASSWORD")
+    else:
+        LOGGER.info("F1_USERNAME is not set, so you will be prompted")
+
+    try:
+        get_token()
+    except Exception as error:  # noqa: BLE001 - any failure means "do not rely on it"
+        LOGGER.error("sign-in failed: %s: %s", type(error).__name__, error)
+        return False
+
+    LOGGER.info("sign-in succeeded; the token is stored and will be reused")
+    return True
+
+
+def record_once(path: Path, idle_timeout: int, no_auth: bool = False) -> None:
     """Run a single client session, appending to `path` if it already exists.
 
     SignalRClient exits on its own once `idle_timeout` seconds pass with no
@@ -111,6 +149,7 @@ def record_once(path: Path, idle_timeout: int) -> None:
         filename=str(path),
         filemode=filemode,
         timeout=idle_timeout,
+        no_auth=no_auth,
     )
     client.start()
 
@@ -212,8 +251,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--session",
-        required=True,
         help="slug for this session, e.g. 2026-las-vegas-fp1",
+    )
+    parser.add_argument(
+        "--check-auth",
+        action="store_true",
+        help=(
+            "sign in to the F1 account and exit, to verify credentials days "
+            "before a session instead of discovering a problem during one"
+        ),
+    )
+    parser.add_argument(
+        "--no-auth",
+        action="store_true",
+        help=(
+            "connect without signing in. FastF1 warns this may work for only "
+            "some sessions, or return empty or partial data -- not worth the "
+            "risk on a session that cannot be recorded twice"
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -257,12 +312,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     LOGGER.info("f1-record starting at %s", started_at)
+
+    if args.check_auth:
+        return 0 if check_auth() else 1
+
+    if not args.session:
+        LOGGER.error("--session is required unless you pass --check-auth")
+        return 2
+
     record(
         session=args.session,
         output_dir=args.output_dir,
         idle_timeout=args.idle_timeout,
         max_reconnects=args.max_reconnects,
         max_consecutive_errors=args.max_consecutive_errors,
+        runner=partial(record_once, no_auth=args.no_auth),
     )
     return 0
 

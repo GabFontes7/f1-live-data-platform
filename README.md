@@ -24,9 +24,31 @@ See [ADR 0001](docs/adr/0001-raw-log-is-the-source-of-truth.md).
 ```bash
 pip install -e .
 
+# days before a session: confirm the login works
+f1-record --check-auth
+
 # during a live session
 f1-record --session 2026-las-vegas-fp1
 ```
+
+### Authentication
+
+The live timing feed requires a free Formula 1 account. Create one at
+[account.formula1.com](https://account.formula1.com), then either let the recorder
+prompt you once, or set the credentials so it never asks:
+
+```bash
+export F1_USERNAME="you@example.com"   # Windows: $env:F1_USERNAME = "..."
+export F1_PASSWORD="..."
+```
+
+FastF1 stores the resulting token on disk and reuses it, so a reconnect in the middle
+of a session does not prompt again. Run `--check-auth` well before a session: a
+credential problem discovered at lights out is a session lost.
+
+`--no-auth` exists as a fallback, but FastF1 warns it may work for only some sessions
+or return empty or partial data, which is a poor trade on a session that cannot be
+recorded twice.
 
 The recorder writes to `data/raw/<session>/<session>.txt` and reconnects on its own
 until you stop it with Ctrl+C. Start it before the session, leave it alone, stop it

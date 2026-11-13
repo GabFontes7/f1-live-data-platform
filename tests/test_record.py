@@ -186,3 +186,32 @@ def test_gives_up_on_repeated_errors_by_default():
     args = rec.build_parser().parse_args(["--session", "s"])
 
     assert args.max_consecutive_errors == rec.DEFAULT_MAX_CONSECUTIVE_ERRORS
+
+
+def test_authentication_is_on_by_default():
+    args = rec.build_parser().parse_args(["--session", "s"])
+
+    assert args.no_auth is False, "partial data is not worth the risk"
+
+
+def test_check_auth_needs_no_session():
+    args = rec.build_parser().parse_args(["--check-auth"])
+
+    assert args.check_auth is True
+    assert args.session is None
+
+
+def test_missing_session_is_refused_before_anything_runs(monkeypatch):
+    called = {"recorded": False}
+    monkeypatch.setattr(rec, "record", lambda **kwargs: called.update(recorded=True))
+
+    assert rec.main([]) == 2
+    assert called["recorded"] is False
+
+
+def test_check_auth_exit_code_follows_the_result(monkeypatch):
+    monkeypatch.setattr(rec, "check_auth", lambda: True)
+    assert rec.main(["--check-auth"]) == 0
+
+    monkeypatch.setattr(rec, "check_auth", lambda: False)
+    assert rec.main(["--check-auth"]) == 1
