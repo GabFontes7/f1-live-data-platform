@@ -269,6 +269,38 @@ def test_a_yellow_flag_lap_is_not_green(pace):
     assert is_green is False, "TrackStatus '12' means a yellow appeared mid-lap"
 
 
+def test_a_swap_during_a_pit_cycle_is_not_a_pass_on_track(tmp_path):
+    """Most raw position swaps are pit stops. The flag keeps them apart."""
+    rows = [
+        lap("FST", 1, 90.0, position=1.0), lap("SLW", 1, 91.0, position=2.0),
+        lap("DNF", 1, 92.0, position=3.0),
+        # Lap 2: FST pits, so both cars moving ahead of him are pit traffic.
+        lap("FST", 2, 99.0, position=3.0, pit_in=1.0),
+        lap("SLW", 2, 90.0, position=1.0),
+        lap("DNF", 2, 91.0, position=2.0),
+        # Lap 3: DNF takes SLW with nobody in the pit lane. A real pass.
+        lap("FST", 3, 92.0, position=3.0),
+        lap("SLW", 3, 91.0, position=2.0),
+        lap("DNF", 3, 90.0, position=1.0),
+    ]
+    bronze = write_bronze(tmp_path / "bronze", make_pace_results(), pd.DataFrame(rows))
+    db_path = warehouse.build(SESSION, bronze, tmp_path / "c.duckdb")
+    connection = duckdb.connect(str(db_path), read_only=True)
+    try:
+        swaps = connection.execute(
+            "SELECT passer, passed, is_on_track FROM gold_position_changes "
+            "ORDER BY passer, passed"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert swaps == [
+        ("DNF", "FST", False),
+        ("DNF", "SLW", True),
+        ("SLW", "FST", False),
+    ]
+
+
 def test_the_profile_counts_what_happened_in_the_session(tmp_path):
     """One row saying what the session was, so the report can decide."""
     rows = []

@@ -289,6 +289,61 @@ compound, and the share itself is kept, because the laps where it moves
 from 1 to 0 are the crossover -- the most interesting laps of the race.
 """
 
+# One row per pair of cars that swapped order between two consecutive laps.
+# Deliberately NOT called overtakes: see docs/adr/0006.
+GOLD_POSITION_CHANGES = """
+CREATE OR REPLACE TABLE gold_position_changes AS
+WITH ranked AS (
+    SELECT
+        session_slug, driver_code, lap_number, position, is_in_lap, is_out_lap,
+        lag(position)   OVER (PARTITION BY driver_code ORDER BY lap_number)
+            AS previous_position,
+        lag(lap_number) OVER (PARTITION BY driver_code ORDER BY lap_number)
+            AS previous_lap
+    FROM silver_laps
+    WHERE position IS NOT NULL
+)
+SELECT
+    a.session_slug,
+    a.lap_number,
+    a.driver_code                              AS passer,
+    b.driver_code                              AS passed,
+    b.previous_position::INT                   AS position_taken,
+    a.is_in_lap OR a.is_out_lap
+        OR b.is_in_lap OR b.is_out_lap         AS pit_lap_involved,
+    NOT (a.is_in_lap OR a.is_out_lap
+         OR b.is_in_lap OR b.is_out_lap)       AS is_on_track
+FROM ranked AS a
+JOIN ranked AS b
+  ON a.lap_number = b.lap_number
+ AND a.driver_code <> b.driver_code
+WHERE a.previous_lap = a.lap_number - 1
+  AND b.previous_lap = b.lap_number - 1
+  AND a.previous_position > b.previous_position
+  AND a.position < b.position
+ORDER BY a.lap_number, a.position
+"""
+
+# 2026 cars carry an overtake aid the race director can switch off, and the
+# switch arrives as a race control message. Which laps had it is a property
+# of the race, so it is carried forward lap by lap rather than left as two
+# messages buried in a list of two hundred.
+GOLD_OVERTAKE_AID = """
+CREATE OR REPLACE TABLE gold_overtake_aid AS
+WITH flips AS (
+    SELECT
+        lap_number,
+        upper(message) LIKE '%OVERTAKE ENABLED%' AS aid_enabled
+    FROM silver_race_control
+    WHERE upper(message) LIKE '%OVERTAKE ENABLED%'
+       OR upper(message) LIKE '%OVERTAKE DISABLED%'
+),
+laps AS (SELECT DISTINCT session_slug, lap_number FROM silver_laps)
+SELECT laps.session_slug, laps.lap_number, flips.aid_enabled
+FROM laps ASOF LEFT JOIN flips ON laps.lap_number >= flips.lap_number
+ORDER BY laps.lap_number
+"""
+
 # What actually happened in this session, in one row. The report reads it to
 # decide which sections have anything to say: a card about rain belongs on a
 # page about a wet race and nowhere else.
@@ -315,6 +370,12 @@ laps AS (
         count(DISTINCT compound)                  AS compounds_used
     FROM silver_laps
 ),
+swaps AS (
+    SELECT
+        sum(is_on_track::INT)         AS on_track_position_changes,
+        count(*)                      AS position_changes_including_pit_cycles
+    FROM gold_position_changes
+),
 state AS (
     SELECT
         sum(is_wet_track::INT)                            AS wet_laps,
@@ -339,9 +400,9 @@ margin AS (
     SELECT gap_to_winner_seconds AS winning_margin_seconds, laps_down AS runner_up_laps_down
     FROM gold_race_classification WHERE finishing_order = 2
 )
-SELECT laps.*, result.*, state.*, changes.lead_changes,
+SELECT laps.*, result.*, state.*, swaps.*, changes.lead_changes,
        margin.winning_margin_seconds, margin.runner_up_laps_down
-FROM laps, result, state, changes
+FROM laps, result, state, changes, swaps
 LEFT JOIN margin ON TRUE
 """
 
@@ -510,6 +571,10 @@ def build(
         connection.execute(GOLD_STINT_PACE)
         connection.execute(GOLD_TRACK_STATE)
         connection.execute(GOLD_TEAMMATE_DELTA)
+        connection.execute(GOLD_POSITION_CHANGES)
+        if "silver_race_control" in loaded_optional:
+            connection.execute(GOLD_OVERTAKE_AID)
+            loaded_optional.append("gold_overtake_aid")
         connection.execute(GOLD_SESSION_PROFILE)
 
         for table in (
@@ -521,6 +586,7 @@ def build(
             "gold_stint_pace",
             "gold_track_state",
             "gold_session_profile",
+            "gold_position_changes",
             "gold_teammate_delta",
             *loaded_optional,
         ):

@@ -200,11 +200,24 @@ def track_condition(
         FROM gold_track_state ORDER BY lap_number
         """
     ).fetchall()
+    aid = (
+        dict(connection.execute(
+            "SELECT lap_number, aid_enabled FROM gold_overtake_aid"
+        ).fetchall())
+        if has_table(connection, "gold_overtake_aid")
+        else {}
+    )
+    rows = [row + (aid.get(row[0]),) for row in rows]
+
     bands = []
     if any(row[3] for row in rows):
         bands.append("wet")
     if any(row[4] != "green" for row in rows):
         bands.append("neutralisation")
+    # Only worth a band when the aid was taken away at some point: a race
+    # where it was available throughout has nothing to show.
+    if any(row[5] is False for row in rows):
+        bands.append("overtake_aid")
     return rows, bands
 
 
@@ -331,19 +344,28 @@ def lap_time_chart(connection: duckdb.DuckDBPyConnection) -> str:
     cell = (x1 - x0) / max(last - first, 1)
     for index, band in enumerate(bands):
         sy = y1 + 34 + index * 26
-        label = ("💦 pista molhada (% do grid em pneu de chuva)"
-                 if band == "wet" else "🚩 corrida neutralizada")
+        icon, label = {
+            "wet": ("💦", "pista molhada"),
+            "neutralisation": ("🚩", "neutralizada"),
+            "overtake_aid": ("🚫", "sem auxílio"),
+        }[band]
         out.append(f"<text x='{x0 - 8}' y='{sy + 12}' text-anchor='end' "
-                   f"class='tick'>{label.split(' ')[0]}</text>")
+                   f"class='tick'>{icon}</text>")
         out.append(f"<text x='{x1 + 10}' y='{sy + 12}' class='tick'>"
-                   f"{esc(label.split(' ', 1)[1])}</text>")
+                   f"{esc(label)}</text>")
         out.append(f"<rect x='{x0}' y='{sy}' width='{x1 - x0}' height='16' "
                    "rx='3' fill='#f4f4f2'/>")
-        for lap, cars, wet_cars, share, neutralisation in state:
+        for lap, cars, wet_cars, share, neutralisation, aid in state:
             if not first <= lap <= last:
                 continue
             x = scale(lap, first, last, x0, x1) - cell / 2
-            if band == "wet":
+            if band == "overtake_aid":
+                if aid is not False:
+                    continue
+                colour, opacity = "#6d28d9", 0.85
+                headline = "Auxílio de ultrapassagem bloqueado"
+                detail = "A direção de prova desativou o recurso nesta volta"
+            elif band == "wet":
                 if not share:
                     continue
                 colour, opacity = "#0067ad", 0.12 + share * 0.78
@@ -577,6 +599,62 @@ def stint_chart(connection: duckdb.DuckDBPyConnection) -> str:
                    f"class='tick'>{lap}</text>")
     out.append("</svg>")
     return "".join(out)
+
+
+def position_change_bars(connection: duckdb.DuckDBPyConnection) -> str:
+    """Who took places on track, and from whom."""
+    rows = connection.execute(
+        """
+        SELECT passer, count(*) AS passes,
+               list(passed ORDER BY lap_number) AS victims,
+               list(lap_number ORDER BY lap_number) AS laps
+        FROM gold_position_changes
+        WHERE is_on_track
+        GROUP BY passer ORDER BY passes DESC, passer
+        """
+    ).fetchall()
+    colours = team_colours(connection)
+    items = []
+    for code, passes, victims, laps in rows:
+        pairs = [f"Volta {lap}: passou {victim}"
+                 for lap, victim in zip(laps, victims, strict=True)]
+        shown = pairs[:10]
+        if len(pairs) > len(shown):
+            shown.append(f"… e mais {len(pairs) - len(shown)}")
+        items.append((code, colours.get(code, UNKNOWN_COLOUR), passes,
+                      plural(passes, "troca", "trocas"),
+                      tip(f"{code} · trocas de posição em pista", *shown)))
+    return bar_list(items)
+
+
+def overtake_aid_note(connection: duckdb.DuckDBPyConnection) -> str:
+    """The 2026 aid, if the race director ever switched it off."""
+    if not has_table(connection, "gold_overtake_aid"):
+        return ""
+    rows = connection.execute(
+        """
+        SELECT a.aid_enabled,
+               count(DISTINCT a.lap_number) AS laps,
+               count(c.lap_number) FILTER (WHERE c.is_on_track) AS changes
+        FROM gold_overtake_aid AS a
+        LEFT JOIN gold_position_changes AS c ON c.lap_number = a.lap_number
+        GROUP BY a.aid_enabled
+        """
+    ).fetchall()
+    states = {row[0]: (row[1], row[2]) for row in rows}
+    if False not in states or True not in states:
+        return ""
+    off_laps, off_changes = states[False]
+    on_laps, on_changes = states[True]
+    return f"""<p class="warn"><b>O recurso de 2026, e por que o número engana.</b>
+A direção de prova desativou o auxílio de ultrapassagem em
+{plural(off_laps, 'volta', 'voltas')} e o liberou em {on_laps}. Com ele
+bloqueado houve <b>{off_changes / off_laps:.2f}</b> troca por volta; com ele
+liberado, <b>{on_changes / on_laps:.2f}</b>. Antes de concluir que o recurso
+atrapalha: as
+voltas bloqueadas são justamente as de pista molhada, quando a diferença de
+ritmo entre dois carros era enorme. Os dois efeitos estão grudados, e uma
+corrida só não separa um do outro. Com uma temporada inteira, separa.</p>"""
 
 
 def teammate_chart(connection: duckdb.DuckDBPyConnection) -> str:
@@ -1539,6 +1617,9 @@ def summary_cards(connection: duckdb.DuckDBPyConnection) -> str:
                       f"{profile['biggest_gainer']} +{int(profile['biggest_gain'])}"))
     if profile.get("pit_stops"):
         cards.append(("🔧", "Paradas nos boxes", f"{int(profile['pit_stops'])}"))
+    if profile.get("on_track_position_changes") is not None:
+        cards.append(("🔀", "Trocas de posição em pista",
+                      f"{int(profile['on_track_position_changes'])}"))
 
     # Conditional: these only exist on the page when they happened on track.
     counted = profile.get("counted_laps") or 0
@@ -1585,10 +1666,12 @@ def tab_summary(connection: duckdb.DuckDBPyConnection) -> str:
     _state, bands = track_condition(connection)
     strips = {
         "wet": "A faixa azul embaixo mostra quanto do grid estava em pneu "
-               "intermediário ou de chuva em cada volta: é o estado da pista "
-               "lido dos pneus.",
-        "neutralisation": "A faixa de baixo marca as voltas em que a corrida "
+               "intermediário ou de chuva em cada volta — quanto mais escura, "
+               "maior a parcela: é o estado da pista lido dos pneus.",
+        "neutralisation": "Outra faixa marca as voltas em que a corrida "
                           "esteve neutralizada, na cor da bandeira.",
+        "overtake_aid": "A faixa roxa marca as voltas em que a direção de "
+                        "prova bloqueou o auxílio de ultrapassagem.",
     }
     condition_note = " ".join(strips[band] for band in bands)
     return f"""{podium(connection)}
@@ -1608,6 +1691,10 @@ resultado publicado pela FIA. Linhas em cinza não foram classificadas.</p>
 
 
 def tab_race(connection: duckdb.DuckDBPyConnection) -> str:
+    raw, on_track = connection.execute(
+        "SELECT count(*), sum(is_on_track::int) FROM gold_position_changes"
+    ).fetchone()
+    pit_share = (raw - (on_track or 0)) / raw * 100 if raw else 0
     return f"""<h2>Posição, volta a volta</h2>
 <p class="note">Uma linha por piloto, na cor da equipe, começando no grid de
 largada (o quadradinho). A bolinha branca marca a volta em que ele entrou no
@@ -1618,7 +1705,17 @@ destaque e as outras se apagam.</p>
 <p class="note">Uma barra por stint, na cor do composto; o número dentro da
 barra é a quantidade de voltas. {HOVER_HINT}</p>
 {stint_chart(connection)}
-{compound_legend(connection)}"""
+{compound_legend(connection)}
+<h2>Trocas de posição em pista</h2>
+<p class="note">Quantas vezes cada piloto terminou a volta à frente de alguém
+que estava na sua frente na volta anterior. <b>Não é a contagem oficial de
+ultrapassagens</b>: ficam de fora as trocas em que algum dos dois estava
+entrando ou saindo do box — eram {pit_share:.0f}% do total bruto nesta corrida
+— mas continuam de fora do nosso alcance a ultrapassagem desfeita dentro da
+mesma volta e a posição real dentro da volta, porque só enxergamos a ordem no
+fim de cada uma. {HOVER_HINT}</p>
+{position_change_bars(connection)}
+{overtake_aid_note(connection)}"""
 
 
 def tab_pace(connection: duckdb.DuckDBPyConnection) -> str:
