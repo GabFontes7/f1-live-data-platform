@@ -7,6 +7,9 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
     "fastf1>=3.9,<4",
+    "pandas>=2.1",
+    "pyarrow>=16",
+    "duckdb>=1.0",
 ]
 
 [project.optional-dependencies]
@@ -17,6 +20,7 @@ dev = [
 
 [project.scripts]
 f1-record = "f1platform.record:main"
+f1-ingest = "f1platform.ingest:main"
 
 [build-system]
 requires = ["hatchling"]
