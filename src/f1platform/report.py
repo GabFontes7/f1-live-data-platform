@@ -21,6 +21,7 @@ import html
 import logging
 import re
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 import duckdb
@@ -29,6 +30,10 @@ LOGGER = logging.getLogger("f1platform.report")
 
 DEFAULT_DB_PATH = Path("data/warehouse.duckdb")
 DEFAULT_OUTPUT_DIR = Path("reports")
+
+
+class SessionNotInWarehouseError(LookupError):
+    """The warehouse exists but was never built for this session."""
 
 # Formula 1's own compound colours, so a chart reads the way television does.
 COMPOUND_COLOURS = {
@@ -141,14 +146,68 @@ def table_of(
     )
 
 
+# Tables the page reads. Each is scoped to one session before rendering, so
+# a warehouse holding a whole season renders one session at a time.
+SESSION_TABLES = (
+    "silver_results",
+    "silver_laps",
+    "silver_weather",
+    "silver_race_control",
+    "gold_race_classification",
+    "gold_fastest_lap",
+    "gold_representative_laps",
+    "gold_stint_pace",
+    "gold_track_state",
+    "gold_session_profile",
+    "gold_position_changes",
+    "gold_teammate_delta",
+    "gold_overtake_aid",
+)
+
+
+def scope_to_session(connection: duckdb.DuckDBPyConnection, slug: str) -> None:
+    """Point every table name at one session's rows.
+
+    The warehouse holds many sessions. Rather than adding a filter to forty
+    queries -- where one forgotten filter silently mixes two races -- each
+    name becomes a temp view over that session alone.
+    """
+    catalog = connection.execute(
+        "SELECT database_name FROM duckdb_databases() "
+        "WHERE database_name NOT IN ('system', 'temp') LIMIT 1"
+    ).fetchone()[0]
+    stored = {
+        row[0]
+        for row in connection.execute(
+            "SELECT table_name FROM duckdb_tables() WHERE database_name = ? "
+            "AND schema_name = 'main'",
+            [catalog],
+        ).fetchall()
+    }
+    # DuckDB will not take a bound parameter inside CREATE VIEW, so the slug
+    # is quoted into the statement with its quotes doubled.
+    literal = "'" + slug.replace("'", "''") + "'"
+    for table in SESSION_TABLES:
+        if table in stored:
+            connection.execute(
+                f'CREATE OR REPLACE TEMP VIEW "{table}" AS SELECT * FROM '
+                f'"{catalog}".main."{table}" WHERE session_slug = {literal}'
+            )
+
+
 def has_table(connection: duckdb.DuckDBPyConnection, name: str) -> bool:
-    """Weather and race control are optional: a session can simply lack them."""
-    return bool(
-        connection.execute(
-            "SELECT count(*) FROM information_schema.tables WHERE table_name = ?",
-            [name],
-        ).fetchone()[0]
-    )
+    """Whether this session has that table AND rows in it.
+
+    Weather and race control are optional, and in a warehouse holding several
+    sessions the table can exist because another session filled it.
+    """
+    present = connection.execute(
+        "SELECT count(*) FROM information_schema.tables WHERE table_name = ?",
+        [name],
+    ).fetchone()[0]
+    if not present:
+        return False
+    return bool(connection.execute(f'SELECT count(*) FROM "{name}"').fetchone()[0])
 
 
 def team_colours(connection: duckdb.DuckDBPyConnection) -> dict[str, str]:
@@ -606,8 +665,8 @@ def position_change_bars(connection: duckdb.DuckDBPyConnection) -> str:
     rows = connection.execute(
         """
         SELECT passer, count(*) AS passes,
-               list(passed ORDER BY lap_number) AS victims,
-               list(lap_number ORDER BY lap_number) AS laps
+               list(passed ORDER BY lap_number, passed) AS victims,
+               list(lap_number ORDER BY lap_number, passed) AS laps
         FROM gold_position_changes
         WHERE is_on_track
         GROUP BY passer ORDER BY passes DESC, passer
@@ -986,7 +1045,7 @@ def leader_lap_ends(connection: duckdb.DuckDBPyConnection) -> list[float]:
 def weather_cards(connection: duckdb.DuckDBPyConnection) -> str:
     window = race_window(connection)
     where, scope = "", "na sessão inteira"
-    if window:
+    if window and session_profile(connection).get("session_kind") != "qualifying":
         where = f"WHERE session_time_seconds BETWEEN {window[0]} AND {window[1]}"
         scope = "durante a corrida"
     row = connection.execute(
@@ -1062,7 +1121,9 @@ def weather_story(connection: duckdb.DuckDBPyConnection) -> str:
         return ""
     (track_lo, track_hi, track_first, track_last, air_lo, air_hi, hum_lo,
      hum_hi, wind_mid, wind_hi, wind_dir, rain, samples, failed) = row
-    scope = "Durante a corrida" if window else "Ao longo da sessão"
+    kind = session_profile(connection).get("session_kind")
+    scope = ("Durante a corrida" if window and kind != "qualifying"
+             else "Ao longo da sessão")
 
     parts = []
     if track_first is not None and track_last is not None:
@@ -1368,10 +1429,11 @@ def build_incidents(messages: list[tuple]) -> list[dict]:
 
 
 def control_messages(connection: duckdb.DuckDBPyConnection) -> list[tuple]:
-    """(lap, flag, message, driver_code, sector) for every message, in order."""
+    """(lap, flag, message, driver_code, sector, when) for every message."""
     return connection.execute(
         """
-        SELECT c.lap_number, c.flag, c.message, r.driver_code, c.sector
+        SELECT c.lap_number, c.flag, c.message, r.driver_code, c.sector,
+               c.message_time
         FROM silver_race_control AS c
         LEFT JOIN silver_results AS r
           ON CAST(r.driver_number AS VARCHAR) = CAST(c.driver_number AS VARCHAR)
@@ -1380,49 +1442,81 @@ def control_messages(connection: duckdb.DuckDBPyConnection) -> list[tuple]:
     ).fetchall()
 
 
+def timeline_axis(messages: list[tuple]) -> str:
+    """Laps, or the clock when the feed sent no lap numbers.
+
+    A race's messages carry a lap. A qualifying session's, in this data, do
+    not: every one of the 87 messages from the 2026 Sao Paulo qualifying has
+    a null lap. Falling back to the clock keeps the tab from going blank.
+    """
+    with_lap = sum(1 for message in messages if message[0] is not None)
+    return "lap" if with_lap >= len(messages) / 2 else "clock"
+
+
+def message_moment(axis: str, lap, when, base) -> tuple[float, str]:
+    """Where a message sits on the axis, and how to name that spot.
+
+    On the clock axis the unit is minutes since the first message, so the
+    scale never deals in epoch seconds and the label is built back from the
+    session's own timestamps.
+    """
+    if axis == "lap":
+        return float(lap), f"Volta {int(lap)}"
+    return round((when - base).total_seconds() / 60), when.strftime("%H:%M")
+
+
 def control_timeline(messages: list[tuple]) -> str:
-    """Every message as a mark on a lap axis, one row per kind."""
-    grouped: dict[tuple[str, int], list[str]] = {}
-    for lap, flag, message, _driver, _sector in messages:
+    """Every message as a mark on a lap or clock axis, one row per kind."""
+    axis = timeline_axis(messages)
+    base = min(message[5] for message in messages)
+    grouped: dict[tuple[str, float], list[str]] = {}
+    labels: dict[float, str] = {}
+    for lap, flag, message, _driver, _sector, when in messages:
         kind = classify_message(flag, message)
-        if kind == "clear" or lap is None:
+        if kind == "clear" or (axis == "lap" and lap is None):
             continue
-        grouped.setdefault((kind, int(lap)), []).append(message)
+        at, label = message_moment(axis, lap, when, base)
+        grouped.setdefault((kind, at), []).append(message)
+        labels[at] = label
     if not grouped:
         return "<p class='empty'>Nenhuma mensagem nesta sessão.</p>"
 
-    last = max(lap for _, lap in grouped)
+    marks = sorted({at for _, at in grouped})
+    first, last = (1, max(marks)) if axis == "lap" else (min(marks), max(marks))
     row_height = 34
     height = len(TIMELINE_ROWS) * row_height + 44
     x0, x1 = 170, WIDTH - 24
     out = [f"<svg viewBox='0 0 {WIDTH} {height}' role='img' "
-           "aria-label='Linha do tempo da direção de prova, por volta'>"]
-    for lap in range(5, last + 1, 5):
-        x = scale(lap, 1, last, x0, x1)
+           "aria-label='Linha do tempo da direção de prova'>"]
+    step = 5 if axis == "lap" else max(round((last - first) / 8), 1)
+    for value in range(int(first) + step, int(last) + 1, step):
+        x = scale(value, first, last, x0, x1)
         out.append(f"<line x1='{x:.1f}' x2='{x:.1f}' y1='8' "
                    f"y2='{height - 30}' stroke='#f1f1ef'/>")
+        text = (value if axis == "lap"
+                else (base + timedelta(minutes=value)).strftime("%H:%M"))
         out.append(f"<text x='{x:.1f}' y='{height - 12}' text-anchor='middle' "
-                   f"class='tick'>{lap}</text>")
+                   f"class='tick'>{esc(text)}</text>")
     out.append(f"<text x='{x0 - 12}' y='{height - 12}' text-anchor='end' "
-               "class='tick'>volta</text>")
+               f"class='tick'>{'volta' if axis == 'lap' else 'hora'}</text>")
     for index, (kind, label, colour) in enumerate(TIMELINE_ROWS):
         y = 12 + index * row_height + row_height / 2
         out.append(f"<line x1='{x0}' x2='{x1}' y1='{y:.1f}' y2='{y:.1f}' "
                    "stroke='#e4e4e0'/>")
         out.append(f"<text x='14' y='{y + 4:.1f}' class='row-label'>{label}</text>")
-        for (item_kind, lap), texts in sorted(grouped.items()):
+        for (item_kind, at), texts in sorted(grouped.items()):
             if item_kind != kind:
                 continue
             shown = texts[:6]
             extra = len(texts) - len(shown)
             hover = tip(
-                f"Volta {lap} · {plural(len(texts), 'mensagem', 'mensagens')}",
+                f"{labels[at]} · {plural(len(texts), 'mensagem', 'mensagens')}",
                 *shown,
                 f"… e mais {extra}" if extra else None,
             )
             radius = min(4.5 + len(texts) * 0.9, 11)
             out.append(
-                f"<circle cx='{scale(lap, 1, last, x0, x1):.1f}' cy='{y:.1f}' "
+                f"<circle cx='{scale(at, first, last, x0, x1):.1f}' cy='{y:.1f}' "
                 f"r='{radius:.1f}' fill='{colour}' fill-opacity='0.78' "
                 f"stroke='#fff' stroke-width='1' class='hoverable'{hover}/>"
             )
@@ -1435,8 +1529,8 @@ SEVERITY_ORDER = ("penalty", "pending", "warn", "open", "clear", "served")
 
 def incident_cards(messages: list[tuple]) -> str:
     relevant = [
-        (lap, flag, message, driver)
-        for lap, flag, message, driver, _sector in messages
+        (lap if lap is not None else when.strftime("%H:%M"), flag, message, driver)
+        for lap, flag, message, driver, _sector, when in messages
         if classify_message(flag, message) in ("incident", "penalty")
     ]
     incidents = build_incidents(relevant)
@@ -1448,13 +1542,15 @@ def incident_cards(messages: list[tuple]) -> str:
         return next(name for name in SEVERITY_ORDER if name in severities)
 
     incidents.sort(key=lambda item: (SEVERITY_ORDER.index(outcome(item)),
-                                     item["steps"][0][0] or 0))
+                                     str(item["steps"][0][0])))
     cards = []
     for item in incidents:
         who = " × ".join(sorted(item["cars"])) or "Pista"
         place = f" · curva {item['turn']}" if item["turn"] else ""
         steps = " <span class='arrow'>→</span> ".join(
-            f"<span class='step {severity}'><b>V{lap}</b> {esc(label)}</span>"
+            f"<span class='step {severity}'>"
+            f"<b>{f'V{lap}' if isinstance(lap, int) else esc(lap)}</b> "
+            f"{esc(label)}</span>"
             for lap, label, severity in item["steps"]
         )
         reason = esc(item["reason"]) if item["reason"] else "Motivo não informado"
@@ -1469,7 +1565,7 @@ def incident_cards(messages: list[tuple]) -> str:
 
 def deleted_laps_bars(messages: list[tuple], colours: dict[str, str]) -> str:
     per_driver: dict[str, list[str]] = {}
-    for _lap, flag, message, driver, _sector in messages:
+    for _lap, flag, message, driver, _sector, _when in messages:
         if classify_message(flag, message) != "deleted":
             continue
         cars = CAR_RE.findall(message)
@@ -1490,8 +1586,8 @@ def deleted_laps_bars(messages: list[tuple], colours: dict[str, str]) -> str:
 
 def blue_flag_bars(messages: list[tuple], colours: dict[str, str]) -> str:
     per_driver: dict[str, list[int]] = {}
-    for lap, flag, _message, driver, _sector in messages:
-        if flag == "BLUE" and driver:
+    for lap, flag, _message, driver, _sector, _when in messages:
+        if flag == "BLUE" and driver and lap is not None:
             per_driver.setdefault(driver, []).append(int(lap) if lap else 0)
     items = [
         (code, colours.get(code, UNKNOWN_COLOUR), len(laps),
@@ -1786,15 +1882,18 @@ valor é guardado como nulo.
 def tab_control(connection: duckdb.DuckDBPyConnection) -> str:
     messages = control_messages(connection)
     colours = team_colours(connection)
+    moment = ("V = volta" if timeline_axis(messages) == "lap"
+              else "marcado pelo horário")
     return f"""<h2>Linha do tempo da direção de prova</h2>
-<p class="note">Cada bolinha reúne as mensagens daquele tipo naquela volta;
-quanto maior, mais mensagens. {HOVER_HINT} O texto original, em inglês, aparece
-na caixinha.</p>
+<p class="note">Cada bolinha reúne as mensagens daquele tipo naquele momento;
+quanto maior, mais mensagens. Quando a cronometragem não manda o número da
+volta — o que acontece na classificação — o eixo passa a ser o relógio.
+{HOVER_HINT} O texto original, em inglês, aparece na caixinha.</p>
 {control_timeline(messages)}
 <h2>Incidentes e punições</h2>
 <p class="note">Cada cartão conta a história de um incidente, do momento em
-que foi anotado até a decisão (V = volta). Aqui entram só as punições
-<em>aplicadas durante a corrida</em>; as decididas depois da bandeirada ficam
+que foi anotado até a decisão ({moment}). Aqui entram só as punições
+<em>aplicadas durante a sessão</em>; as decididas depois da bandeirada ficam
 nos documentos da FIA.</p>
 {incident_cards(messages)}
 <div class="two-col"><div>
@@ -1854,6 +1953,18 @@ def tab_raw(connection: duckdb.DuckDBPyConnection) -> str:
             FROM gold_teammate_delta ORDER BY delta_seconds
             """)),
     ]
+    if has_table(connection, "gold_qualifying_result"):
+        blocks.append(details(
+            "Classificação por segmento (gold_qualifying_result)", table_of(
+                connection, """
+            SELECT qualifying_position, driver_code, team_name,
+                   round(q1_seconds, 3) AS q1_s, round(q2_seconds, 3) AS q2_s,
+                   round(q3_seconds, 3) AS q3_s, reached_segment, eliminated_in,
+                   round(gap_to_pole_seconds, 3) AS gap_to_pole_s,
+                   q1_timed_laps, q2_timed_laps, q3_timed_laps,
+                   matches_published
+            FROM gold_qualifying_result ORDER BY qualifying_position
+            """, scroll=False)))
     if has_table(connection, "silver_weather"):
         blocks.append(details("Clima, cada leitura (silver_weather)", table_of(
             connection, """
@@ -1878,7 +1989,375 @@ inglês, para bater com as consultas. Clique para abrir.</p>
 {''.join(blocks)}"""
 
 
-TABS = (
+
+# --------------------------------------------------------------------------
+# qualifying
+# --------------------------------------------------------------------------
+
+SEGMENT_COLOURS = {1: "#64748b", 2: "#0ea5e9", 3: "#7c3aed"}
+
+
+def qualifying_lap_chart(connection: duckdb.DuckDBPyConnection) -> str:
+    """Every timed lap against the clock, coloured by segment.
+
+    The x axis is the session's own clock rather than the lap number: in
+    qualifying a driver's lap 8 and another's lap 8 happen minutes apart, and
+    what the chart is really showing is the track getting quicker.
+    """
+    rows = connection.execute(
+        """
+        SELECT coalesce(l.lap_start_seconds, l.session_time_seconds) / 60,
+               l.lap_time_seconds, s.segment_number, l.driver_code,
+               l.compound, l.is_deleted, l.is_personal_best
+        FROM silver_laps AS l
+        JOIN gold_qualifying_segments AS s
+          ON s.driver_code = l.driver_code AND s.lap_number = l.lap_number
+        WHERE l.lap_time_seconds IS NOT NULL
+          AND NOT l.is_in_lap AND NOT l.is_out_lap
+        ORDER BY 1
+        """
+    ).fetchall()
+    if not rows:
+        return "<p class='empty'>Nenhuma volta cronometrada.</p>"
+
+    pole = connection.execute(
+        "SELECT driver_code, best_seconds FROM gold_qualifying_result "
+        "ORDER BY qualifying_position LIMIT 1"
+    ).fetchone()
+
+    height = 420
+    times = sorted(row[1] for row in rows)
+    low, high = times[0], times[int(len(times) * 0.97)]
+    pad = (high - low) * 0.06
+    low, high = low - pad, high + pad
+    minutes = [row[0] for row in rows]
+    first, last = min(minutes), max(minutes)
+    x0, x1 = PAD_L, WIDTH - PAD_R
+    y0, y1 = PAD_T, height - PAD_B
+
+    out = [f"<svg viewBox='0 0 {WIDTH} {height}' role='img' class='focusable' "
+           "aria-label='Tempo de cada volta cronometrada ao longo da sessão'>"]
+    for index in range(6):
+        value = low + (high - low) * index / 5
+        y = scale(value, low, high, y1, y0)
+        out.append(f"<line x1='{x0}' x2='{x1}' y1='{y:.1f}' y2='{y:.1f}' "
+                   "stroke='#ececea'/>")
+        out.append(f"<text x='{x0 - 8}' y='{y + 4:.1f}' text-anchor='end' "
+                   f"class='tick'>{fmt_lap(value)}</text>")
+
+    # Each segment gets a band behind its laps, so the three sessions inside
+    # the session are visible without reading the legend.
+    for number in sorted({row[2] for row in rows}):
+        inside = [row[0] for row in rows if row[2] == number]
+        bx0 = scale(min(inside), first, last, x0, x1) - 3
+        bx1 = scale(max(inside), first, last, x0, x1) + 3
+        out.append(f"<rect x='{bx0:.1f}' y='{y0}' width='{bx1 - bx0:.1f}' "
+                   f"height='{y1 - y0}' fill='{SEGMENT_COLOURS[number]}' "
+                   "fill-opacity='0.05'/>")
+        out.append(f"<text x='{(bx0 + bx1) / 2:.1f}' y='{y0 + 14}' "
+                   f"text-anchor='middle' class='panel-title' "
+                   f"fill='{SEGMENT_COLOURS[number]}'>Q{number}</text>")
+
+    for minute in range(int(first // 10 * 10), int(last) + 1, 10):
+        if minute < first:
+            continue
+        x = scale(minute, first, last, x0, x1)
+        out.append(f"<text x='{x:.1f}' y='{y1 + 22}' text-anchor='middle' "
+                   f"class='tick'>{minute} min</text>")
+
+    for minute, seconds, number, code, compound, deleted, personal_best in rows:
+        if not low <= seconds <= high:
+            continue
+        x = scale(minute, first, last, x0, x1)
+        y = scale(seconds, low, high, y1, y0)
+        is_pole = pole and code == pole[0] and abs(seconds - pole[1]) < 0.0005
+        hover = tip(
+            f"{code} · Q{number}" + (" · POLE" if is_pole else ""),
+            fmt_lap(seconds),
+            f"Minuto {minute:.0f} da sessão · {compound_name(compound)}",
+            "Volta deletada" if deleted else
+            ("Melhor volta pessoal" if personal_best else None),
+        )
+        colour = SEGMENT_COLOURS[number]
+        if deleted:
+            out.append(f"<circle cx='{x:.1f}' cy='{y:.1f}' r='3.4' fill='none' "
+                       f"stroke='{colour}' stroke-width='1.2' "
+                       f"stroke-dasharray='1.5 1.5' data-d='{esc(code)}'"
+                       f"{hover}/>")
+            continue
+        out.append(f"<circle cx='{x:.1f}' cy='{y:.1f}' r='{3.6 if is_pole else 2.8}' "
+                   f"fill='{colour}' fill-opacity='0.75' data-d='{esc(code)}'"
+                   f"{hover}/>")
+        if is_pole:
+            out.append(f"<text x='{x + 8:.1f}' y='{y + 4:.1f}' "
+                       f"class='series-label' fill='{colour}'>POLE "
+                       f"{esc(code)}</text>")
+    out.append("</svg>")
+    return "".join(out)
+
+
+def qualifying_table(connection: duckdb.DuckDBPyConnection) -> str:
+    """The grid as it was decided, with each segment's time and where it ended."""
+    rows = connection.execute(
+        """
+        SELECT qualifying_position, driver_code, driver_name, team_name,
+               q1_seconds, q2_seconds, q3_seconds, best_seconds,
+               gap_to_pole_seconds, eliminated_in,
+               q1_timed_laps, q2_timed_laps, q3_timed_laps
+        FROM gold_qualifying_result ORDER BY qualifying_position
+        """
+    ).fetchall()
+    colours = team_colours(connection)
+    bests = [
+        connection.execute(
+            f"SELECT min({column}) FROM gold_qualifying_result"
+        ).fetchone()[0]
+        for column in ("q1_seconds", "q2_seconds", "q3_seconds")
+    ]
+
+    body = []
+    for (position, code, name, team, q1, q2, q3, _best, gap, eliminated,
+         laps1, laps2, laps3) in rows:
+        cells = []
+        for index, (value, laps) in enumerate(
+            ((q1, laps1), (q2, laps2), (q3, laps3))
+        ):
+            if value is None:
+                cells.append("<td class='num null'>—</td>")
+                continue
+            fastest = bests[index] is not None and abs(value - bests[index]) < 0.0005
+            hover = tip(
+                f"{code} · Q{index + 1}",
+                fmt_lap(value),
+                (f"Melhor de {plural(int(laps), 'volta cronometrada', 'voltas cronometradas')}"
+                 if laps else None),
+                f"+{value - bests[index]:.3f} s para o melhor do segmento"
+                if not fastest and bests[index] is not None else "Melhor do segmento",
+            )
+            klass = "num best" if fastest else "num"
+            cells.append(f"<td class='{klass}'{hover}>{fmt_lap(value)}</td>")
+
+        klass = f" class='out-q{eliminated}'" if eliminated else ""
+        swatch = (f"<i class='swatch' style='background:"
+                  f"{colours.get(code, UNKNOWN_COLOUR)}'></i>")
+        # A Q1 time and a Q3 time were set on different tracks: in this wet
+        # session Q1 ran four seconds slower, so a gap across segments would
+        # flatter whoever was knocked out earliest. Only Q3 is compared.
+        if q3 is None:
+            to_pole = "<span class='muted-cell'>caiu no "
+            to_pole += f"Q{eliminated}</span>" if eliminated else "—</span>"
+        elif gap == 0:
+            to_pole = "pole"
+        else:
+            to_pole = f"+{gap:.3f}"
+        body.append(
+            f"<tr{klass}><td class='pos'>{int(position)}</td>"
+            f"<td>{swatch}<b>{esc(code)}</b> {esc(name)}</td>"
+            f"<td>{esc(team)}</td>{''.join(cells)}"
+            f"<td class='num'>{to_pole}</td></tr>"
+        )
+    return (
+        "<table class='data'><thead><tr><th>Pos</th><th>Piloto</th>"
+        "<th>Equipe</th><th class='num'>Q1</th><th class='num'>Q2</th>"
+        "<th class='num'>Q3</th><th class='num'>Para a pole</th></tr></thead>"
+        f"<tbody>{''.join(body)}</tbody></table>"
+    )
+
+
+def qualifying_cards(connection: duckdb.DuckDBPyConnection) -> str:
+    rows = connection.execute(
+        """
+        SELECT driver_code, driver_name, team_name, best_seconds,
+               gap_to_pole_seconds, eliminated_in
+        FROM gold_qualifying_result ORDER BY qualifying_position
+        """
+    ).fetchall()
+    cards = []
+    if rows:
+        cards.append(("🏆", "Pole", f"{rows[0][0]} {fmt_lap(rows[0][3])}"))
+    if len(rows) > 1 and rows[1][4] is not None:
+        cards.append(("⏱️", "Para o segundo", f"{rows[1][4]:.3f} s"))
+    cuts = {}
+    for row in rows:
+        if row[5]:
+            cuts[row[5]] = cuts.get(row[5], 0) + 1
+    for segment in sorted(cuts):
+        cards.append(("✂️", f"Eliminados no Q{segment}", f"{cuts[segment]}"))
+    cards.append(("🧮", "Pilotos", f"{len(rows)}"))
+    wet_share = connection.execute(
+        "SELECT avg(wet_tyre_share) FROM gold_track_state"
+    ).fetchone()[0] if has_table(connection, "gold_track_state") else None
+    if wet_share:
+        cards.append(("💦", "Pista",
+                      "molhada o tempo todo" if wet_share > 0.99
+                      else f"molhada em {wet_share * 100:.0f}% das voltas"))
+    reds = connection.execute(
+        "SELECT count(*) FROM silver_race_control "
+        "WHERE upper(message) LIKE '%RED FLAG%'"
+    ).fetchone()[0] if has_table(connection, "silver_race_control") else 0
+    if reds:
+        cards.append(("🟥", "Bandeiras vermelhas", f"{reds}"))
+    return "<div class='cards'>" + "".join(
+        f"<div class='card'><span class='card-icon'>{icon}</span>"
+        f"<span class='card-value'>{esc(value)}</span>"
+        f"<span class='card-label'>{esc(label)}</span></div>"
+        for icon, label, value in cards
+    ) + "</div>"
+
+
+def qualifying_podium(connection: duckdb.DuckDBPyConnection) -> str:
+    rows = connection.execute(
+        "SELECT driver_code, driver_name, team_name, best_seconds "
+        "FROM gold_qualifying_result ORDER BY qualifying_position LIMIT 3"
+    ).fetchall()
+    colours = team_colours(connection)
+    labels = ("Pole", "2º", "3º")
+    return "<div class='podium'>" + "".join(
+        f"<div class='step-card' style='border-top-color:"
+        f"{colours.get(code, UNKNOWN_COLOUR)}'><span class='medal'>"
+        f"{'🏆' if index == 0 else '🥈' if index == 1 else '🥉'}</span>"
+        f"<span class='card-value'>{esc(name)}</span>"
+        f"<span class='card-label'>{esc(team)} · {labels[index]} · "
+        f"{fmt_lap(best)}</span></div>"
+        for index, (code, name, team, best) in enumerate(rows)
+    ) + "</div>"
+
+
+def qualifying_teammates(connection: duckdb.DuckDBPyConnection) -> str:
+    """The duel, judged in the deepest segment both drivers reached."""
+    rows = connection.execute(
+        """
+        WITH pairs AS (
+            SELECT a.team_name, a.driver_code AS fast, b.driver_code AS slow,
+                   CASE WHEN a.q3_seconds IS NOT NULL AND b.q3_seconds IS NOT NULL
+                             THEN 3
+                        WHEN a.q2_seconds IS NOT NULL AND b.q2_seconds IS NOT NULL
+                             THEN 2
+                        WHEN a.q1_seconds IS NOT NULL AND b.q1_seconds IS NOT NULL
+                             THEN 1 END AS segment,
+                   a.q1_seconds AS a1, a.q2_seconds AS a2, a.q3_seconds AS a3,
+                   b.q1_seconds AS b1, b.q2_seconds AS b2, b.q3_seconds AS b3
+            FROM gold_qualifying_result AS a
+            JOIN gold_qualifying_result AS b
+              ON b.team_name = a.team_name
+             AND b.qualifying_position > a.qualifying_position
+        )
+        SELECT team_name,
+               CASE WHEN a_time <= b_time THEN fast ELSE slow END AS quicker,
+               CASE WHEN a_time <= b_time THEN slow ELSE fast END AS slower,
+               segment,
+               least(a_time, b_time)    AS fast_time,
+               greatest(a_time, b_time) AS slow_time
+        FROM (
+            SELECT *,
+                   CASE segment WHEN 3 THEN a3 WHEN 2 THEN a2 ELSE a1 END AS a_time,
+                   CASE segment WHEN 3 THEN b3 WHEN 2 THEN b2 ELSE b1 END AS b_time
+            FROM pairs
+        ) WHERE segment IS NOT NULL
+        ORDER BY slow_time - fast_time DESC
+        """
+    ).fetchall()
+    colours = team_colours(connection)
+    items = []
+    for team, fast, slow, segment, fast_time, slow_time in rows:
+        gap = slow_time - fast_time
+        items.append((
+            f"{fast} × {slow}", colours.get(fast, UNKNOWN_COLOUR), abs(gap),
+            f"+{gap:.3f} s",
+            tip(f"{team} · comparados no Q{segment}",
+                f"{fast}: {fmt_lap(fast_time)}",
+                f"{slow}: {fmt_lap(slow_time)}",
+                f"Último segmento em que os dois cravaram tempo: Q{segment}"),
+        ))
+    return bar_list(items)
+
+
+def qualifying_sector_table(connection: duckdb.DuckDBPyConnection) -> str:
+    """Best sector of each driver, and the ideal lap they add up to."""
+    rows = connection.execute(
+        """
+        SELECT driver_code, min(sector1_seconds), min(sector2_seconds),
+               min(sector3_seconds),
+               min(sector1_seconds) + min(sector2_seconds) + min(sector3_seconds)
+        FROM silver_laps
+        WHERE NOT is_deleted AND NOT is_in_lap AND NOT is_out_lap
+        GROUP BY driver_code
+        HAVING min(sector1_seconds) IS NOT NULL
+        ORDER BY 5
+        """
+    ).fetchall()
+    colours = team_colours(connection)
+    return heat_table(
+        "Piloto",
+        ["Melhor S1", "Melhor S2", "Melhor S3", "Volta ideal"],
+        [(row[0], colours.get(row[0], UNKNOWN_COLOUR), list(row[1:]))
+         for row in rows],
+        higher_is_better=False,
+        fmt=lambda value: fmt_lap(value) if value >= 60 else f"{value:.3f}",
+        unit="",
+    )
+
+
+def segment_note(connection: duckdb.DuckDBPyConnection) -> str:
+    """Say how the segments were worked out, and whether the guess held."""
+    rows = connection.execute(
+        """
+        SELECT s.segment, count(DISTINCT s.driver_code), count(*)
+        FROM gold_qualifying_segments AS s GROUP BY s.segment ORDER BY s.segment
+        """
+    ).fetchall()
+    checked, matched = connection.execute(
+        "SELECT count(*), sum(matches_published::int) FROM gold_qualifying_result"
+    ).fetchone()
+    shape = ", ".join(
+        f"{segment} com {plural(drivers, 'piloto', 'pilotos')} e "
+        f"{plural(laps, 'volta', 'voltas')}"
+        for segment, drivers, laps in rows
+    )
+    verdict = (
+        f"o melhor tempo de cada um dos {checked} pilotos em cada segmento bateu "
+        "com o tempo publicado no resultado, ao milésimo"
+        if matched == checked else
+        f"<b>{checked - (matched or 0)} piloto(s) não bateram com o tempo "
+        "publicado</b>, então trate a divisão por segmento com desconfiança"
+    )
+    return f"""<p class="note">A cronometragem não diz a qual segmento cada
+volta pertence: ela manda voltas soltas. Nós deduzimos olhando a pista
+esvaziar — minutos sem ninguém marcando tempo separam um segmento do
+seguinte. Deu {shape}. Para conferir a dedução, {verdict}.</p>"""
+
+
+def tab_qualifying_summary(connection: duckdb.DuckDBPyConnection) -> str:
+    return f"""{qualifying_podium(connection)}
+{qualifying_cards(connection)}
+<h2>Como ficou o grid</h2>
+<p class="note">O tempo de cada piloto em cada segmento. A célula roxa é o
+melhor daquele segmento; linhas apagadas são quem caiu ali. A última coluna
+compara só quem chegou ao Q3: um tempo de Q1 e um de Q3 foram feitos em
+pistas diferentes. A diferença dentro de cada segmento está na caixinha de
+cada tempo. {HOVER_HINT}</p>
+{qualifying_table(connection)}
+{segment_note(connection)}"""
+
+
+def tab_qualifying_laps(connection: duckdb.DuckDBPyConnection) -> str:
+    return f"""<h2>Tempo de volta ao longo da sessão</h2>
+<p class="note">Cada ponto é uma volta cronometrada, posicionada pelo relógio
+da sessão e colorida pelo segmento. É aqui que se vê a pista evoluindo: o
+mesmo piloto, meia hora depois, anda vários segundos mais rápido. Círculos
+vazados e tracejados são voltas deletadas. {HOVER_HINT}</p>
+{qualifying_lap_chart(connection)}
+<h2>Duelo entre companheiros</h2>
+<p class="note">Comparados no último segmento em que os dois cravaram tempo —
+comparar um tempo de Q3 com um de Q1 seria comparar pistas diferentes.
+{HOVER_HINT}</p>
+{qualifying_teammates(connection)}
+<h2>Setores</h2>
+<p class="note">O melhor setor de cada piloto na sessão inteira, e a volta
+ideal que eles somam. A célula roxa é o melhor da coluna. {HOVER_HINT}</p>
+{qualifying_sector_table(connection)}"""
+
+TABS_RACE = (
     ("summary", "🏁 Resumo", tab_summary),
     ("race", "📈 Corrida", tab_race),
     ("pace", "⏱️ Ritmo", tab_pace),
@@ -1888,12 +2367,27 @@ TABS = (
     ("raw", "🗂️ Dados brutos", tab_raw),
 )
 
+TABS_QUALIFYING = (
+    ("summary", "🏁 Resumo", tab_qualifying_summary),
+    ("laps", "⏱️ Voltas", tab_qualifying_laps),
+    ("speed", "🚀 Velocidade", tab_speed),
+    ("weather", "🌦️ Clima", tab_weather),
+    ("control", "🚩 Direção de prova", tab_control),
+    ("raw", "🗂️ Dados brutos", tab_raw),
+)
+
+
+def tabs_for(connection: duckdb.DuckDBPyConnection) -> tuple:
+    """A qualifying session is not a short race: it gets its own page."""
+    kind = session_profile(connection).get("session_kind")
+    return TABS_QUALIFYING if kind == "qualifying" else TABS_RACE
+
 
 def build_tabs(connection: duckdb.DuckDBPyConnection) -> list[tuple[str, str, str]]:
     """Each tab: (slug, label, html). An optional tab is dropped, not emptied."""
     return [
         (slug, label, build(connection))
-        for slug, label, build in TABS
+        for slug, label, build in tabs_for(connection)
         if slug not in TAB_REQUIRES or has_table(connection, TAB_REQUIRES[slug])
     ]
 
@@ -1975,6 +2469,9 @@ td.flag { color: #45453f; }
 td.pos { font-weight: 650; width: 44px; }
 table.heat td { border-bottom: 2px solid #fff; border-right: 2px solid #fff; }
 table.heat td.best { background: #6d28d9; color: #fff; font-weight: 700; }
+td.best { background: #6d28d9; color: #fff; font-weight: 700; }
+tr.out-q1 td { color: #a3a39c; } tr.out-q1 td.best { color: #fff; }
+tr.out-q2 td { color: #74746d; } tr.out-q2 td.best { color: #fff; }
 tr.unclassified td { color: #9a9a93; }
 .muted-cell { color: #9a9a93; font-size: 11.5px; }
 .up { color: #15803d; } .down { color: #b91c1c; }
@@ -2161,6 +2658,11 @@ def build_report(
 
     connection = duckdb.connect(str(db_path), read_only=True)
     try:
+        scope_to_session(connection, session_slug)
+        if not connection.execute("SELECT count(*) FROM silver_laps").fetchone()[0]:
+            raise SessionNotInWarehouseError(
+                f"{session_slug} is not in {db_path} -- run f1-build for it first"
+            )
         page = render(connection, session_slug)
     finally:
         connection.close()
@@ -2191,7 +2693,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         path = build_report(args.session, args.db, args.output_dir)
-    except FileNotFoundError as error:
+    except (FileNotFoundError, SessionNotInWarehouseError) as error:
         LOGGER.error("%s", error)
         return 1
 

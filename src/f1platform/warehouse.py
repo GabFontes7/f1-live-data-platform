@@ -63,9 +63,25 @@ SELECT
     CAST("Points" AS DOUBLE)               AS points,
     CAST("Laps" AS INTEGER)                AS laps_completed,
     CAST("Time" AS DOUBLE)                 AS time_seconds,
+    {{segment_times}},
     "ClassifiedPosition" NOT IN ({_codes_sql()}) AS is_classified
 FROM read_parquet(?)
 """
+
+# A qualifying result carries one column per segment; a race result does not.
+# Both become the same silver table, with nulls where the session had no
+# segments, so every query downstream can ignore which kind of session it is.
+SEGMENT_COLUMNS = ("Q1", "Q2", "Q3")
+
+
+def silver_results_sql(available: set[str]) -> str:
+    return SILVER_RESULTS.format(
+        segment_times=",\n    ".join(
+            (f'CAST("{column}" AS DOUBLE)' if column in available else "NULL::DOUBLE")
+            + f"{'':<12} AS {column.lower()}_seconds"
+            for column in SEGMENT_COLUMNS
+        )
+    )
 
 SILVER_LAPS = """
 CREATE OR REPLACE TABLE silver_laps AS
@@ -289,6 +305,111 @@ compound, and the share itself is kept, because the laps where it moves
 from 1 to 0 are the crossover -- the most interesting laps of the race.
 """
 
+# Qualifying runs in segments, and the timing feed does not label them: a lap
+# arrives with no mark saying whether it was Q1, Q2 or Q3. What the feed does
+# show is the track emptying between segments, so the laps fall into blocks
+# separated by minutes of nobody running. The blocks are numbered in order.
+#
+# The guess is then checked, in gold_qualifying_result, against the segment
+# times the result itself publishes. In the 2026 Sao Paulo qualifying the
+# blocks held 22, 15 and 10 drivers and every driver's best lap in each block
+# matched the published time to the millisecond.
+SEGMENT_BREAK_SECONDS = 180
+
+GOLD_QUALIFYING_SEGMENTS = f"""
+CREATE OR REPLACE TABLE gold_qualifying_segments AS
+WITH timed AS (
+    SELECT *, coalesce(lap_start_seconds, session_time_seconds) AS at_seconds
+    FROM silver_laps
+),
+gaps AS (
+    SELECT *,
+           CASE WHEN at_seconds - lag(at_seconds) OVER (ORDER BY at_seconds)
+                     > {SEGMENT_BREAK_SECONDS}
+                THEN 1 ELSE 0 END AS starts_block
+    FROM timed
+),
+blocks AS (
+    SELECT *, sum(starts_block) OVER (ORDER BY at_seconds
+                                      ROWS UNBOUNDED PRECEDING) AS block
+    FROM gaps
+),
+-- A block where nobody set a time is not a segment: it is cars going to the
+-- end of the pit lane, or a session waiting for the rain to stop.
+running AS (
+    SELECT block, min(at_seconds) AS started
+    FROM blocks GROUP BY block HAVING count(lap_time_seconds) > 0
+),
+numbered AS (
+    SELECT block, row_number() OVER (ORDER BY started) AS segment_number
+    FROM running
+)
+SELECT
+    b.session_slug,
+    b.driver_code,
+    b.lap_number,
+    n.segment_number,
+    'Q' || n.segment_number AS segment
+FROM blocks AS b
+JOIN numbered AS n USING (block)
+"""
+
+GOLD_QUALIFYING_RESULT = """
+CREATE OR REPLACE TABLE gold_qualifying_result AS
+WITH best AS (
+    SELECT
+        s.driver_code,
+        s.segment_number,
+        min(l.lap_time_seconds) AS best_seconds,
+        count(l.lap_time_seconds) AS timed_laps
+    FROM gold_qualifying_segments AS s
+    JOIN silver_laps AS l
+      ON l.driver_code = s.driver_code AND l.lap_number = s.lap_number
+    WHERE l.lap_time_seconds IS NOT NULL AND NOT l.is_deleted
+    GROUP BY s.driver_code, s.segment_number
+),
+measured AS (
+    SELECT
+        driver_code,
+        max(best_seconds) FILTER (WHERE segment_number = 1) AS measured_q1,
+        max(best_seconds) FILTER (WHERE segment_number = 2) AS measured_q2,
+        max(best_seconds) FILTER (WHERE segment_number = 3) AS measured_q3,
+        max(timed_laps)   FILTER (WHERE segment_number = 1) AS q1_timed_laps,
+        max(timed_laps)   FILTER (WHERE segment_number = 2) AS q2_timed_laps,
+        max(timed_laps)   FILTER (WHERE segment_number = 3) AS q3_timed_laps,
+        max(segment_number)                                 AS segments_run
+    FROM best GROUP BY driver_code
+),
+joined AS (
+    SELECT
+        r.session_slug, r.driver_code, r.driver_name, r.team_name,
+        r.team_colour, r.finishing_order AS qualifying_position,
+        r.q1_seconds, r.q2_seconds, r.q3_seconds,
+        m.measured_q1, m.measured_q2, m.measured_q3,
+        m.q1_timed_laps, m.q2_timed_laps, m.q3_timed_laps,
+        coalesce(m.segments_run, 0) AS segments_run,
+        coalesce(r.q3_seconds, r.q2_seconds, r.q1_seconds) AS best_seconds,
+        CASE WHEN r.q3_seconds IS NOT NULL THEN 3
+             WHEN r.q2_seconds IS NOT NULL THEN 2
+             WHEN r.q1_seconds IS NOT NULL THEN 1 END AS reached_segment
+    FROM silver_results AS r
+    LEFT JOIN measured AS m ON m.driver_code = r.driver_code
+)
+SELECT
+    *,
+    best_seconds - min(best_seconds) OVER ()       AS gap_to_pole_seconds,
+    CASE WHEN reached_segment = 3 THEN NULL
+         ELSE reached_segment END                  AS eliminated_in,
+    -- Did the blocks we inferred reproduce the published segment times? A
+    -- tenth of a millisecond of slack covers the rounding, nothing more.
+    coalesce(abs(coalesce(measured_q1, 0) - coalesce(q1_seconds, 0)) < 0.0005, TRUE)
+    AND coalesce(abs(coalesce(measured_q2, 0) - coalesce(q2_seconds, 0)) < 0.0005, TRUE)
+    AND coalesce(abs(coalesce(measured_q3, 0) - coalesce(q3_seconds, 0)) < 0.0005, TRUE)
+                                                   AS matches_published
+FROM joined
+ORDER BY qualifying_position
+"""
+
 # One row per pair of cars that swapped order between two consecutive laps.
 # Deliberately NOT called overtakes: see docs/adr/0006.
 GOLD_POSITION_CHANGES = """
@@ -386,6 +507,11 @@ state AS (
         count(*)                                          AS counted_laps
     FROM gold_track_state
 ),
+kind AS (
+    SELECT CASE WHEN count(q1_seconds) > 0 THEN 'qualifying' ELSE 'race' END
+               AS session_kind
+    FROM silver_results
+),
 result AS (
     SELECT
         max(laps_completed)                       AS race_laps,
@@ -400,9 +526,9 @@ margin AS (
     SELECT gap_to_winner_seconds AS winning_margin_seconds, laps_down AS runner_up_laps_down
     FROM gold_race_classification WHERE finishing_order = 2
 )
-SELECT laps.*, result.*, state.*, swaps.*, changes.lead_changes,
+SELECT laps.*, kind.*, result.*, state.*, swaps.*, changes.lead_changes,
        margin.winning_margin_seconds, margin.runner_up_laps_down
-FROM laps, result, state, changes, swaps
+FROM laps, result, state, changes, swaps, kind
 LEFT JOIN margin ON TRUE
 """
 
@@ -527,12 +653,118 @@ ORDER BY delta_seconds
 """
 
 
+def catalog_of(connection: duckdb.DuckDBPyConnection) -> str:
+    """The attached database's name, needed to say "the stored table, not mine".
+
+    Every statement here builds a temp table whose name matches a stored one,
+    and an unqualified name resolves to the temp copy. Only a fully qualified
+    name reaches the stored table.
+    """
+    return connection.execute(
+        "SELECT database_name FROM duckdb_databases() "
+        "WHERE database_name NOT IN ('system', 'temp') LIMIT 1"
+    ).fetchone()[0]
+
+
+def stage(
+    connection: duckdb.DuckDBPyConnection,
+    sql: str,
+    parameters: list | None = None,
+) -> None:
+    """Run one build statement into a temp table rather than a stored one."""
+    connection.execute(
+        sql.replace("CREATE OR REPLACE TABLE", "CREATE OR REPLACE TEMP TABLE"),
+        parameters or [],
+    )
+
+
+def merge(
+    connection: duckdb.DuckDBPyConnection,
+    catalog: str,
+    table: str,
+    session_slug: str,
+) -> int:
+    """Replace one session's rows in a stored table with the staged ones.
+
+    Sessions accumulate: a warehouse holds a whole weekend, and eventually a
+    whole season, so one session can be compared with another. Rebuilding a
+    session replaces its own rows and leaves every other session alone.
+    """
+    stored = f'"{catalog}".main."{table}"'
+    staged_columns = [
+        row[0] for row in connection.execute(f'DESCRIBE "{table}"').fetchall()
+    ]
+    exists = connection.execute(
+        "SELECT count(*) FROM duckdb_tables() WHERE database_name = ? "
+        "AND schema_name = 'main' AND table_name = ?",
+        [catalog, table],
+    ).fetchone()[0]
+
+    if exists:
+        stored_columns = [
+            row[0] for row in connection.execute(f"DESCRIBE {stored}").fetchall()
+        ]
+        if stored_columns != staged_columns:
+            # The shape changed, so rows written by an older version of this
+            # code cannot be trusted to mean the same thing.
+            LOGGER.warning(
+                "%s changed shape; dropping it. Rebuild the other sessions.",
+                table,
+            )
+            connection.execute(f"DROP TABLE {stored}")
+            exists = False
+
+    if not exists:
+        connection.execute(
+            f'CREATE TABLE {stored} AS SELECT * FROM "{table}" WHERE FALSE'
+        )
+    if "session_slug" in staged_columns:
+        connection.execute(
+            f"DELETE FROM {stored} WHERE session_slug = ?", [session_slug]
+        )
+    connection.execute(f'INSERT INTO {stored} BY NAME SELECT * FROM "{table}"')
+    return connection.execute(
+        f"SELECT count(*) FROM {stored}"
+        + (" WHERE session_slug = ?" if "session_slug" in staged_columns else ""),
+        [session_slug] if "session_slug" in staged_columns else [],
+    ).fetchone()[0]
+
+
+def drop_session(
+    connection: duckdb.DuckDBPyConnection, catalog: str, session_slug: str
+) -> None:
+    """Forget everything stored about one session before rebuilding it.
+
+    A session that had weather last time and does not now must not keep the
+    old rows: they would be read as this session's.
+    """
+    for (table,) in connection.execute(
+        "SELECT table_name FROM duckdb_tables() WHERE database_name = ? "
+        "AND schema_name = 'main'",
+        [catalog],
+    ).fetchall():
+        columns = [
+            row[0]
+            for row in connection.execute(
+                f'DESCRIBE "{catalog}".main."{table}"'
+            ).fetchall()
+        ]
+        if "session_slug" in columns:
+            connection.execute(
+                f'DELETE FROM "{catalog}".main."{table}" WHERE session_slug = ?',
+                [session_slug],
+            )
+
+
 def build(
     session_slug: str,
     bronze_dir: Path = DEFAULT_BRONZE_DIR,
     db_path: Path = DEFAULT_DB_PATH,
 ) -> Path:
-    """Build silver and gold tables for one session into a DuckDB file."""
+    """Build one session's silver and gold tables into a DuckDB file.
+
+    The file holds every session built into it, keyed by `session_slug`.
+    """
     session_dir = bronze_dir / session_slug
     results_parquet = session_dir / "results.parquet"
     laps_parquet = session_dir / "laps.parquet"
@@ -555,28 +787,53 @@ def build(
     db_path.parent.mkdir(parents=True, exist_ok=True)
     connection = duckdb.connect(str(db_path))
     try:
-        connection.execute(SILVER_RESULTS, [session_slug, str(results_parquet)])
-        connection.execute(SILVER_LAPS, [session_slug, str(laps_parquet)])
+        catalog = catalog_of(connection)
+        available = {
+            row[0]
+            for row in connection.execute(
+                "DESCRIBE SELECT * FROM read_parquet(?)", [str(results_parquet)]
+            ).fetchall()
+        }
+        stage(
+            connection,
+            silver_results_sql(available),
+            [session_slug, str(results_parquet)],
+        )
+        stage(connection, SILVER_LAPS, [session_slug, str(laps_parquet)])
 
         loaded_optional = []
         for name, (sql, path) in optional.items():
             if path.exists():
-                connection.execute(sql, [session_slug, str(path)])
+                stage(connection, sql, [session_slug, str(path)])
                 loaded_optional.append(name)
             else:
                 LOGGER.warning("%s is absent, skipping %s", path.name, name)
-        connection.execute(GOLD_CLASSIFICATION)
-        connection.execute(GOLD_FASTEST_LAP)
-        connection.execute(GOLD_REPRESENTATIVE_LAPS)
-        connection.execute(GOLD_STINT_PACE)
-        connection.execute(GOLD_TRACK_STATE)
-        connection.execute(GOLD_TEAMMATE_DELTA)
-        connection.execute(GOLD_POSITION_CHANGES)
+        stage(connection, GOLD_CLASSIFICATION)
+        stage(connection, GOLD_FASTEST_LAP)
+        stage(connection, GOLD_REPRESENTATIVE_LAPS)
+        stage(connection, GOLD_STINT_PACE)
+        stage(connection, GOLD_TRACK_STATE)
+        stage(connection, GOLD_TEAMMATE_DELTA)
+        stage(connection, GOLD_POSITION_CHANGES)
         if "silver_race_control" in loaded_optional:
-            connection.execute(GOLD_OVERTAKE_AID)
+            stage(connection, GOLD_OVERTAKE_AID)
             loaded_optional.append("gold_overtake_aid")
-        connection.execute(GOLD_SESSION_PROFILE)
+        is_qualifying = bool(
+            connection.execute(
+                "SELECT count(q1_seconds) FROM silver_results"
+            ).fetchone()[0]
+        )
+        qualifying_tables = []
+        if is_qualifying:
+            stage(connection, GOLD_QUALIFYING_SEGMENTS)
+            stage(connection, GOLD_QUALIFYING_RESULT)
+            qualifying_tables = [
+                "gold_qualifying_segments",
+                "gold_qualifying_result",
+            ]
+        stage(connection, GOLD_SESSION_PROFILE)
 
+        drop_session(connection, catalog, session_slug)
         for table in (
             "silver_results",
             "silver_laps",
@@ -588,10 +845,16 @@ def build(
             "gold_session_profile",
             "gold_position_changes",
             "gold_teammate_delta",
+            *qualifying_tables,
             *loaded_optional,
         ):
-            rows = connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+            rows = merge(connection, catalog, table, session_slug)
             LOGGER.info("%s: %s rows", table, f"{rows:,}")
+
+        sessions = connection.execute(
+            f'SELECT count(DISTINCT session_slug) FROM "{catalog}".main.silver_laps'
+        ).fetchone()[0]
+        LOGGER.info("warehouse now holds %s session(s)", sessions)
     finally:
         connection.close()
 

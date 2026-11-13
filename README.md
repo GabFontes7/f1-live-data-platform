@@ -10,9 +10,11 @@ for the 2026 São Paulo Grand Prix from raw timing data — the podium, the thre
 penalties applied after the flag, both unclassified drivers and the fastest lap —
 against a 25 KB committed fixture. No Formula 1 account needed to verify it.
 
-**Status: phase 0 — the recorder.** The next live sessions are the Las Vegas Grand
-Prix (19–21 Nov 2026) and Abu Dhabi (4–6 Dec 2026). After that the feed goes quiet
-until March, so capturing a session now is the one deadline this project has.
+**Status: phase 3 — post-session analysis.** The warehouse holds a race and a
+qualifying session, each rendered as a self-contained HTML page. The next live
+sessions are the Las Vegas Grand Prix (19–21 Nov 2026) and Abu Dhabi (4–6 Dec
+2026). After that the feed goes quiet until March, so capturing a session now is
+the one deadline this project has.
 
 ## Why a raw log
 
@@ -37,11 +39,31 @@ f1-record --check-auth
 # during a live session
 f1-record --session 2026-las-vegas-fp1
 
-# after a session: bronze, then the warehouse
+# after a session: bronze, then the warehouse, then the page
 f1-ingest --year 2026 --event "Sao Paulo Grand Prix" --session R
-f1-build --session 2026-sao-paulo-grand-prix-r
+f1-build  --session 2026-sao-paulo-grand-prix-r
+f1-report --session 2026-sao-paulo-grand-prix-r
+
+# sessions accumulate in one warehouse file
+f1-ingest --year 2026 --event "Sao Paulo Grand Prix" --session Q
+f1-build  --session 2026-sao-paulo-grand-prix-q
+f1-report --session 2026-sao-paulo-grand-prix-q
+
 pytest -q
 ```
+
+A race and a qualifying session are different questions, so they get different
+pages: a race page is built around classification, strategy and position changes,
+a qualifying page around the three segments, the track evolving between them and
+the gap to pole. Which one gets built is decided by the data, not by the file
+name.
+
+Qualifying carries a problem worth naming: the timing feed never says which
+segment a lap belonged to. The segments are inferred from the track emptying
+between runs, then checked against the segment times the result publishes — in
+the 2026 São Paulo qualifying, all 22 drivers' best laps matched to the
+millisecond. See [ADR 0005](docs/adr/0005-a-section-must-earn-its-place.md) for
+why a page shows only what its own session produced.
 
 The last command runs the acceptance test, which rebuilds the FIA's published
 classification for that race from the raw data: the podium, the three time

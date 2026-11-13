@@ -80,6 +80,29 @@ def dry_laps(**kwargs):
             for driver in ("FST", "SLW", "DNF") for number in range(1, 7)]
 
 
+def test_a_qualifying_session_gets_its_own_page(tmp_path):
+    """A qualifying session is not a short race: different tabs, different cards."""
+    from tests.test_warehouse import make_qualifying_results, qualifying_laps
+
+    results = make_qualifying_results(
+        q1=[95.0, 95.4, 95.9], q2=[94.0, 94.4, None], q3=[93.0, None, None]
+    )
+    bronze = write_bronze(tmp_path / "bronze", results, qualifying_laps())
+    db_path = tmp_path / "q.duckdb"
+    warehouse.build(SESSION, bronze, db_path)
+    connection = duckdb.connect(str(db_path), read_only=True)
+    try:
+        page = report.render(connection, SESSION)
+        slugs = [slug for slug, _, _ in report.tabs_for(connection)]
+    finally:
+        connection.close()
+
+    assert slugs[:2] == ["summary", "laps"]
+    assert "Como ficou o grid" in page and "Pole" in page
+    assert "Classificação</h2>" not in page, "no race classification table"
+    assert "Estratégia" not in page, "no pit strategy in a qualifying session"
+
+
 def test_a_dry_race_says_nothing_about_rain(tmp_path):
     """The page describes this session, not the one the code was written for.
 

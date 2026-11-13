@@ -269,6 +269,136 @@ def test_a_yellow_flag_lap_is_not_green(pace):
     assert is_green is False, "TrackStatus '12' means a yellow appeared mid-lap"
 
 
+def make_qualifying_results(q1, q2, q3) -> pd.DataFrame:
+    """A qualifying result: the three segment columns a race never has."""
+    results = make_pace_results()
+    results["Q1"], results["Q2"], results["Q3"] = q1, q2, q3
+    results["Position"] = [1.0, 2.0, 3.0]
+    return results
+
+
+def qualifying_laps() -> pd.DataFrame:
+    """Three blocks of laps with the track emptying in between.
+
+    `lap()` places lap n at 90n seconds, so a gap in lap numbers is a gap in
+    the clock -- which is exactly the signal the segments are read from.
+    """
+    rows = []
+    for driver, offset, blocks in (
+        ("FST", 0.0, (1, 2, 3)),
+        ("SLW", 0.4, (1, 2)),
+        ("DNF", 0.9, (1,)),
+    ):
+        for block in blocks:
+            start = (block - 1) * 20 + 1
+            for number in (start, start + 1):
+                rows.append(
+                    lap(driver, number, 96.0 - block + offset, position=1.0)
+                )
+    return pd.DataFrame(rows)
+
+
+def test_qualifying_segments_are_read_from_the_track_emptying(tmp_path):
+    """The feed never says Q1, Q2 or Q3: the gaps between runs do."""
+    results = make_qualifying_results(
+        q1=[95.0, 95.4, 95.9], q2=[94.0, 94.4, None], q3=[93.0, None, None]
+    )
+    bronze = write_bronze(tmp_path / "bronze", results, qualifying_laps())
+    db_path = warehouse.build(SESSION, bronze, tmp_path / "q.duckdb")
+    connection = duckdb.connect(str(db_path), read_only=True)
+    try:
+        segments = connection.execute(
+            "SELECT segment, count(DISTINCT driver_code), count(*) "
+            "FROM gold_qualifying_segments GROUP BY segment ORDER BY segment"
+        ).fetchall()
+        result = connection.execute(
+            "SELECT driver_code, reached_segment, eliminated_in, "
+            "matches_published FROM gold_qualifying_result "
+            "ORDER BY qualifying_position"
+        ).fetchall()
+        kind = connection.execute(
+            "SELECT session_kind FROM gold_session_profile"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+
+    assert segments == [("Q1", 3, 6), ("Q2", 2, 4), ("Q3", 1, 2)]
+    assert result == [
+        ("FST", 3, None, True),
+        ("SLW", 2, 2, True),
+        ("DNF", 1, 1, True),
+    ]
+    assert kind == "qualifying"
+
+
+def test_an_inferred_segment_that_contradicts_the_result_says_so(tmp_path):
+    """The check is the point: a wrong guess must not pass silently."""
+    results = make_qualifying_results(
+        q1=[95.0, 95.4, 95.9], q2=[1.0, 94.4, None], q3=[93.0, None, None]
+    )
+    bronze = write_bronze(tmp_path / "bronze", results, qualifying_laps())
+    db_path = warehouse.build(SESSION, bronze, tmp_path / "bad.duckdb")
+    connection = duckdb.connect(str(db_path), read_only=True)
+    try:
+        agreed = connection.execute(
+            "SELECT matches_published FROM gold_qualifying_result "
+            "WHERE driver_code = 'FST'"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+
+    assert agreed is False
+
+
+def test_two_sessions_live_in_one_warehouse_without_mixing(tmp_path):
+    """A weekend, and eventually a season, in one file."""
+    race = write_bronze(tmp_path / "race", make_pace_results(),
+                        pd.DataFrame([lap("FST", n, 90.0) for n in range(1, 5)]))
+    db_path = tmp_path / "both.duckdb"
+    warehouse.build(SESSION, race, db_path)
+
+    other = tmp_path / "quali"
+    (other / "2026-other-q").mkdir(parents=True)
+    results = make_qualifying_results(
+        q1=[95.0, 95.4, 95.9], q2=[94.0, 94.4, None], q3=[93.0, None, None]
+    )
+    results.to_parquet(other / "2026-other-q" / "results.parquet", index=False)
+    qualifying_laps().to_parquet(other / "2026-other-q" / "laps.parquet", index=False)
+    warehouse.build("2026-other-q", other, db_path)
+
+    connection = duckdb.connect(str(db_path), read_only=True)
+    try:
+        counts = connection.execute(
+            "SELECT session_slug, count(*) FROM silver_laps "
+            "GROUP BY session_slug ORDER BY session_slug"
+        ).fetchall()
+        kinds = connection.execute(
+            "SELECT session_slug, session_kind FROM gold_session_profile "
+            "ORDER BY session_slug"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert counts == [("2026-other-q", 12), (SESSION, 4)]
+    assert kinds == [("2026-other-q", "qualifying"), (SESSION, "race")]
+
+
+def test_rebuilding_a_session_replaces_only_its_own_rows(tmp_path):
+    race = write_bronze(tmp_path / "race", make_pace_results(),
+                        pd.DataFrame([lap("FST", n, 90.0) for n in range(1, 5)]))
+    db_path = tmp_path / "again.duckdb"
+    warehouse.build(SESSION, race, db_path)
+    warehouse.build(SESSION, race, db_path)
+
+    connection = duckdb.connect(str(db_path), read_only=True)
+    try:
+        laps = connection.execute("SELECT count(*) FROM silver_laps").fetchone()[0]
+    finally:
+        connection.close()
+
+    assert laps == 4, "a second build must replace the session, not duplicate it"
+
+
 def test_a_swap_during_a_pit_cycle_is_not_a_pass_on_track(tmp_path):
     """Most raw position swaps are pit stops. The flag keeps them apart."""
     rows = [
