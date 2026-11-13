@@ -54,6 +54,26 @@ f1-report --all
 pytest -q
 ```
 
+### A whole season
+
+```bash
+# every round's qualifying and race, carrying on past the ones that fail
+f1-ingest --year 2026 --season
+
+# add practice or sprints when you want them
+f1-ingest --year 2026 --season --sessions FP1,SQ,S,Q,R
+```
+
+A season has rounds that have not happened yet and weekends whose feed came
+back short. One of those must not cost the other forty-seven, so each failure
+is logged and the run carries on; the summary at the end names what was
+skipped and why.
+
+Each ingest also records the event itself — round number, name, country,
+circuit — from what FastF1 already knew about the session, at no extra
+request. That is what lets the index say "Etapa 21 · São Paulo Grand Prix
+2026" and order the site by the championship rather than by the alphabet.
+
 ### The site
 
 `f1-report --all` writes one self-contained HTML file per session into

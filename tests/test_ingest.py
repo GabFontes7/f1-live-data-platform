@@ -45,6 +45,113 @@ def test_slug_separates_sessions_of_the_same_event():
     assert race.slug != quali.slug
 
 
+# --- event metadata ---------------------------------------------------------
+
+
+def fake_event(**overrides):
+    """A row of FastF1's schedule, with only the fields ingestion reads."""
+    row = {
+        "RoundNumber": 21,
+        "EventName": "São Paulo Grand Prix",
+        "OfficialEventName": "FORMULA 1 GRANDE PRÊMIO DE SÃO PAULO 2026",
+        "Country": "Brazil",
+        "Location": "São Paulo",
+        "EventFormat": "conventional",
+        "EventDate": pd.Timestamp("2026-11-08"),
+    }
+    row.update(overrides)
+    return pd.Series(row)
+
+
+def test_the_event_is_recorded_with_the_session(tmp_path):
+    """The round number comes free with the session FastF1 already loaded."""
+    session = FakeSession(pd.DataFrame({"Abbreviation": ["FST"]}))
+    session.event = fake_event()
+
+    metadata = ing.event_metadata(session)
+    ing.write_bronze(
+        ing.SessionRef(2026, "Sao Paulo Grand Prix", "R"),
+        {"results": pd.DataFrame({"Abbreviation": ["FST"]})},
+        tmp_path,
+        metadata,
+    )
+
+    written = json.loads(
+        (tmp_path / "2026-sao-paulo-grand-prix-r" / "event.json").read_text()
+    )
+    assert written["RoundNumber"] == 21
+    assert written["EventDate"] == "2026-11-08", "a date, not a timestamp blob"
+    assert written["session_code"] == "R"
+
+
+def test_a_session_without_event_metadata_still_lands(tmp_path):
+    """Older sessions, and anything FastF1 cannot name, must not break."""
+    session = FakeSession(pd.DataFrame({"Abbreviation": ["FST"]}))
+
+    assert ing.event_metadata(session) == {}
+
+    ing.write_bronze(
+        ing.SessionRef(2026, "Sao Paulo Grand Prix", "R"),
+        {"results": pd.DataFrame({"Abbreviation": ["FST"]})},
+        tmp_path,
+        {},
+    )
+
+    assert not (tmp_path / "2026-sao-paulo-grand-prix-r" / "event.json").exists()
+
+
+# --- a whole season ---------------------------------------------------------
+
+
+def fake_schedule():
+    """Two rounds: one conventional, one with a sprint."""
+    return pd.DataFrame([
+        {"RoundNumber": 1, "EventName": "Alpha Grand Prix",
+         "Session1": "Practice 1", "Session2": "Practice 2",
+         "Session3": "Practice 3", "Session4": "Qualifying", "Session5": "Race"},
+        {"RoundNumber": 2, "EventName": "Beta Grand Prix",
+         "Session1": "Practice 1", "Session2": "Sprint Qualifying",
+         "Session3": "Sprint", "Session4": "Qualifying", "Session5": "Race"},
+    ])
+
+
+def test_a_season_lists_only_the_sessions_each_round_held(monkeypatch, tmp_path):
+    monkeypatch.setattr(ing.fastf1, "get_event_schedule",
+                        lambda *a, **k: fake_schedule())
+
+    refs = ing.season_refs(2026, ("Q", "R", "S"), tmp_path)
+
+    assert [ref.slug for ref in refs] == [
+        "2026-alpha-grand-prix-q",
+        "2026-alpha-grand-prix-r",
+        "2026-beta-grand-prix-s",
+        "2026-beta-grand-prix-q",
+        "2026-beta-grand-prix-r",
+    ], "the sprint belongs to the second round only"
+
+
+def test_one_broken_session_does_not_stop_the_season(monkeypatch, tmp_path):
+    """Forty-seven good sessions must not be lost to one bad one."""
+    monkeypatch.setattr(ing.fastf1, "get_event_schedule",
+                        lambda *a, **k: fake_schedule())
+
+    attempted = []
+
+    def flaky(ref, output_dir, cache_dir):
+        attempted.append(ref.slug)
+        if ref.slug == "2026-alpha-grand-prix-r":
+            raise ing.EmptySessionError("no drivers")
+        return output_dir / ref.slug
+
+    monkeypatch.setattr(ing, "ingest", flaky)
+    done, failed = ing.ingest_season(2026, ("Q", "R"), tmp_path, tmp_path)
+
+    assert len(attempted) == 4
+    assert done == ["2026-alpha-grand-prix-q", "2026-beta-grand-prix-q",
+                    "2026-beta-grand-prix-r"]
+    assert failed == [("2026-alpha-grand-prix-r", "no drivers")]
+
+
 # --- the guard that matters -------------------------------------------------
 
 

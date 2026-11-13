@@ -257,6 +257,35 @@ WET_COMPOUNDS = ("INTERMEDIATE", "WET")
 # it are running a wet-weather compound.
 WET_TRACK_SHARE = 0.5
 
+# What event this session belongs to, written by the ingest from what FastF1
+# already knew. Optional: sessions ingested before this existed have no file,
+# and their pages fall back to reading the slug.
+SILVER_EVENT = """
+CREATE OR REPLACE TABLE silver_event AS
+SELECT
+    ? AS session_slug,
+    CAST("RoundNumber" AS INTEGER)   AS round_number,
+    "EventName"                      AS event_name,
+    "OfficialEventName"              AS official_event_name,
+    "Country"                        AS country,
+    "Location"                       AS location,
+    "EventFormat"                    AS event_format,
+    CAST("EventDate" AS DATE)        AS event_date,
+    "session_code"                   AS session_code
+FROM read_json_auto(?)
+"""
+
+EMPTY_EVENT = """
+CREATE OR REPLACE TABLE silver_event AS
+SELECT
+    ''::VARCHAR AS session_slug, NULL::INTEGER AS round_number,
+    NULL::VARCHAR AS event_name, NULL::VARCHAR AS official_event_name,
+    NULL::VARCHAR AS country, NULL::VARCHAR AS location,
+    NULL::VARCHAR AS event_format, NULL::DATE AS event_date,
+    NULL::VARCHAR AS session_code
+WHERE FALSE
+"""
+
 # TrackStatus is a concatenation of every code seen during the lap: 1 clear,
 # 2 yellow, 4 safety car, 5 red flag, 6 virtual safety car, 7 VSC ending. A
 # lap is neutralised if ANY car saw the code, because the neutralisation is
@@ -572,6 +601,16 @@ kind AS (
                AS session_kind
     FROM silver_results
 ),
+event AS (
+    SELECT
+        max(round_number)        AS round_number,
+        max(event_name)          AS event_name,
+        max(official_event_name) AS official_event_name,
+        max(country)             AS country,
+        max(location)            AS location,
+        max(event_format)        AS event_format
+    FROM silver_event
+),
 result AS (
     SELECT
         max(laps_completed)                       AS race_laps,
@@ -586,9 +625,10 @@ margin AS (
     SELECT gap_to_winner_seconds AS winning_margin_seconds, laps_down AS runner_up_laps_down
     FROM gold_race_classification WHERE finishing_order = 2
 )
-SELECT laps.*, kind.*, result.*, state.*, swaps.*, changes.lead_changes,
+SELECT laps.*, kind.*, event.*, result.*, state.*, swaps.*,
+       changes.lead_changes,
        margin.winning_margin_seconds, margin.runner_up_laps_down
-FROM laps, result, state, changes, swaps, kind
+FROM laps, result, state, changes, swaps, kind, event
 LEFT JOIN margin ON TRUE
 """
 
@@ -835,6 +875,8 @@ def build(
                 f"{required} is missing -- run f1-ingest for {session_slug} first"
             )
 
+    event_json = session_dir / "event.json"
+
     # Weather and race control are not guaranteed: a session can lack either.
     optional = {
         "silver_weather": (SILVER_WEATHER, session_dir / "weather_data.parquet"),
@@ -868,6 +910,14 @@ def build(
                 loaded_optional.append(name)
             else:
                 LOGGER.warning("%s is absent, skipping %s", path.name, name)
+        if event_json.exists():
+            stage(connection, SILVER_EVENT, [session_slug, str(event_json)])
+            loaded_optional.append("silver_event")
+        else:
+            LOGGER.warning(
+                "event.json is absent: this session knows no round number"
+            )
+            stage(connection, EMPTY_EVENT)
         stage(connection, GOLD_CLASSIFICATION)
         stage(connection, GOLD_FASTEST_LAP)
         stage(connection, GOLD_REPRESENTATIVE_LAPS)

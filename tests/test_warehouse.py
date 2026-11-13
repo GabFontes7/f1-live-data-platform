@@ -8,6 +8,8 @@ quicker still, a lapped finisher. CI runs these without any downloaded data.
 
 from __future__ import annotations
 
+import json
+
 import duckdb
 import pandas as pd
 import pytest
@@ -351,6 +353,50 @@ def test_an_inferred_segment_that_contradicts_the_result_says_so(tmp_path):
         connection.close()
 
     assert agreed is False
+
+
+def write_event(bronze, slug, round_number=21, name="São Paulo Grand Prix"):
+    (bronze / slug).mkdir(parents=True, exist_ok=True)
+    (bronze / slug / "event.json").write_text(json.dumps({
+        "slug": slug, "session_code": slug.rsplit("-", 1)[-1].upper(),
+        "RoundNumber": round_number, "EventName": name,
+        "OfficialEventName": f"FORMULA 1 {name.upper()}", "Country": "Brazil",
+        "Location": "São Paulo", "EventFormat": "conventional",
+        "EventDate": "2026-11-08",
+    }), encoding="utf-8")
+
+
+def test_the_round_number_reaches_the_profile(tmp_path):
+    """Which round of the championship this was, straight from the ingest."""
+    bronze = write_bronze(tmp_path / "bronze", make_pace_results(),
+                          pd.DataFrame([lap("FST", n, 90.0) for n in range(1, 5)]))
+    write_event(bronze, SESSION)
+    db_path = warehouse.build(SESSION, bronze, tmp_path / "e.duckdb")
+    connection = duckdb.connect(str(db_path), read_only=True)
+    try:
+        profile = connection.execute(
+            "SELECT round_number, event_name, country FROM gold_session_profile"
+        ).fetchone()
+    finally:
+        connection.close()
+
+    assert profile == (21, "São Paulo Grand Prix", "Brazil")
+
+
+def test_a_session_without_event_metadata_still_builds(tmp_path):
+    """Sessions ingested before the event file existed must still work."""
+    bronze = write_bronze(tmp_path / "bronze", make_pace_results(),
+                          pd.DataFrame([lap("FST", n, 90.0) for n in range(1, 5)]))
+    db_path = warehouse.build(SESSION, bronze, tmp_path / "n.duckdb")
+    connection = duckdb.connect(str(db_path), read_only=True)
+    try:
+        round_number = connection.execute(
+            "SELECT round_number FROM gold_session_profile"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+
+    assert round_number is None
 
 
 def test_two_sessions_live_in_one_warehouse_without_mixing(tmp_path):

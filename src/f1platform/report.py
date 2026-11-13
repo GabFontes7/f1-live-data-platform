@@ -2155,8 +2155,33 @@ def qualifying_lap_chart(connection: duckdb.DuckDBPyConnection) -> str:
     return "".join(out)
 
 
+def segment_tyres(connection: duckdb.DuckDBPyConnection) -> dict[tuple, str]:
+    """Which tyre each driver's segment time was set on.
+
+    The result publishes the time, not the tyre. The lap that set it is in
+    the timing data, so the two are matched on the time itself.
+    """
+    rows = connection.execute(
+        """
+        SELECT q.driver_code, s.segment_number, any_value(l.compound)
+        FROM gold_qualifying_result AS q
+        JOIN gold_qualifying_segments AS s ON s.driver_code = q.driver_code
+        JOIN silver_laps AS l
+          ON l.driver_code = s.driver_code AND l.lap_number = s.lap_number
+        WHERE l.lap_time_seconds IS NOT NULL AND abs(
+            l.lap_time_seconds - CASE s.segment_number
+                WHEN 1 THEN q.q1_seconds WHEN 2 THEN q.q2_seconds
+                ELSE q.q3_seconds END
+        ) < 0.0005
+        GROUP BY q.driver_code, s.segment_number
+        """
+    ).fetchall()
+    return {(row[0], row[1]): row[2] for row in rows}
+
+
 def qualifying_table(connection: duckdb.DuckDBPyConnection) -> str:
     """The grid as it was decided, with each segment's time and where it ended."""
+    tyres = segment_tyres(connection)
     rows = connection.execute(
         """
         SELECT qualifying_position, driver_code, driver_name, team_name,
@@ -2185,16 +2210,21 @@ def qualifying_table(connection: duckdb.DuckDBPyConnection) -> str:
                 cells.append("<td class='num null'>—</td>")
                 continue
             fastest = bests[index] is not None and abs(value - bests[index]) < 0.0005
+            tyre = tyres.get((code, index + 1))
             hover = tip(
                 f"{code} · Q{index + 1}",
                 fmt_lap(value),
+                f"Pneu {compound_name(tyre).lower()}" if tyre else None,
                 (f"Melhor de {plural(int(laps), 'volta cronometrada', 'voltas cronometradas')}"
                  if laps else None),
                 f"+{value - bests[index]:.3f} s para o melhor do segmento"
                 if not fastest and bests[index] is not None else "Melhor do segmento",
             )
             klass = "num best" if fastest else "num"
-            cells.append(f"<td class='{klass}'{hover}>{fmt_lap(value)}</td>")
+            cells.append(
+                f"<td class='{klass}'{hover}>{tyre_badge(tyre)}"
+                f"<span class='cell-time'>{fmt_lap(value)}</span></td>"
+            )
 
         klass = f" class='out-q{eliminated}'" if eliminated else ""
         swatch = (f"<i class='swatch' style='background:"
@@ -2422,7 +2452,8 @@ def tab_qualifying_summary(connection: duckdb.DuckDBPyConnection) -> str:
 {qualifying_cards(connection)}
 <h2>Como ficou o grid</h2>
 <p class="note">O tempo de cada piloto em cada segmento. A célula roxa é o
-melhor daquele segmento; linhas apagadas são quem caiu ali. A última coluna
+melhor daquele segmento, e o anel colorido é o pneu em que o tempo foi
+feito. Linhas apagadas são quem caiu ali. A última coluna
 compara só quem chegou ao Q3: um tempo de Q1 e um de Q3 foram feitos em
 pistas diferentes. A diferença dentro de cada segmento está na caixinha de
 cada tempo. {HOVER_HINT}</p>
@@ -2509,6 +2540,10 @@ code { background: #f1f1ed; padding: 1px 4px; border-radius: 3px; font-size: 92%
         font-size: 11px; font-weight: 700; vertical-align: 2px; padding: 0 2px; }
 .tyre-name { font-size: 12.5px; font-weight: 600; margin-left: 5px;
              vertical-align: 3px; }
+td .tyre { min-width: 18px; height: 18px; line-height: 14px; font-size: 9.5px;
+           border-width: 2px; margin-right: 6px; vertical-align: 1px; }
+.cell-time { font-variant-numeric: tabular-nums; }
+td.best .tyre { border-color: #fff !important; color: #fff !important; }
 .card-value { display: block; font-size: 18px; font-weight: 650; }
 .card-label { display: block; color: #6b6b68; font-size: 12.5px; margin-top: 2px; }
 .podium { display: flex; flex-wrap: wrap; gap: 9px; margin: 0 0 9px; }
@@ -2733,18 +2768,20 @@ def stored_sessions(connection: duckdb.DuckDBPyConnection) -> list[dict]:
     rows = connection.execute(
         f'SELECT session_slug, session_kind, winner, race_laps, laps_run, '
         f'wet_laps, safety_car_laps, red_flag_laps, on_track_position_changes, '
-        f'session_date FROM "{catalog}".main.gold_session_profile '
+        f'session_date, round_number, event_name, country, location '
+        f'FROM "{catalog}".main.gold_session_profile '
         f'ORDER BY session_date DESC NULLS LAST, session_slug'
     ).fetchall()
     sessions = []
     for row in rows:
         event, year, label = event_of(row[0])
         sessions.append({
-            "slug": row[0], "kind": row[1], "event": event, "year": year,
-            "label": label, "winner": row[2], "race_laps": row[3],
+            "slug": row[0], "kind": row[1], "event": row[11] or event,
+            "year": year, "label": label, "winner": row[2], "race_laps": row[3],
             "laps_run": row[4], "wet_laps": row[5] or 0,
             "safety_car_laps": row[6] or 0, "red_flag_laps": row[7] or 0,
-            "position_changes": row[8], "date": row[9],
+            "position_changes": row[8], "date": row[9], "round": row[10],
+            "country": row[12], "location": row[13],
         })
     return sessions
 
@@ -2758,24 +2795,33 @@ def session_rank(slug: str) -> int:
     return SESSION_ORDER.index(suffix) if suffix in SESSION_ORDER else 99
 
 
+def event_label(sessions: list[dict]) -> str:
+    """"Etapa 21 · São Paulo Grand Prix 2026", or as much of it as is known."""
+    first = sessions[0]
+    name = f"{first['event']} {first['year']}".strip()
+    return f"Etapa {int(first['round'])} · {name}" if first.get("round") else name
+
+
 def grouped_sessions(sessions: list[dict]) -> list[tuple[str, list[dict]]]:
-    """Events newest first, and inside each, the weekend's own running order."""
+    """Events in championship order when known, newest first; then by date."""
     groups: dict[str, list[dict]] = {}
     for session in sessions:
-        groups.setdefault(f"{session['event']} {session['year']}".strip(),
-                          []).append(session)
-    ordered = sorted(
-        groups.items(),
-        key=lambda pair: (
-            max((item["date"] for item in pair[1] if item["date"]), default=None)
-            is None,
-            [-(item["date"].toordinal()) for item in pair[1] if item["date"]][:1]
-            or [0],
-        ),
-    )
+        key = f"{session['event']} {session['year']}".strip()
+        groups.setdefault(key, []).append(session)
+
+    def order(items: list[dict]):
+        rounds = [item["round"] for item in items if item.get("round")]
+        dates = [item["date"] for item in items if item["date"]]
+        return (
+            0 if rounds else 1,
+            -max(rounds) if rounds else 0,
+            -max(dates).toordinal() if dates else 0,
+        )
+
     return [
-        (event, sorted(items, key=lambda item: session_rank(item["slug"])))
-        for event, items in ordered
+        (event_label(items),
+         sorted(items, key=lambda item: session_rank(item["slug"])))
+        for _key, items in sorted(groups.items(), key=lambda pair: order(pair[1]))
     ]
 
 

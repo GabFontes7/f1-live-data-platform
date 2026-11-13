@@ -346,6 +346,48 @@ def test_every_page_links_to_every_other(tmp_path):
     )
 
 
+def test_the_index_numbers_the_rounds_when_it_knows_them(tmp_path):
+    from tests.test_warehouse import write_event
+
+    db_path = two_session_warehouse(tmp_path)
+    bronze = tmp_path / "bronze"
+    for slug, number in (("2026-somewhere-grand-prix-r", 7),
+                         ("2026-somewhere-grand-prix-q", 7)):
+        write_event(bronze, slug, round_number=number, name="Somewhere Grand Prix")
+        warehouse.build(slug, bronze, db_path)
+
+    report.build_site(db_path, tmp_path / "site")
+    index = (tmp_path / "site" / "index.html").read_text(encoding="utf-8")
+
+    assert "Etapa 7 · Somewhere Grand Prix" in index
+
+
+def test_each_qualifying_time_shows_the_tyre_it_was_set_on(tmp_path):
+    """A wet session changes tyre between segments: the table must show it."""
+    from tests.test_warehouse import make_qualifying_results, qualifying_laps
+
+    laps = qualifying_laps()
+    laps["Compound"] = [
+        "WET" if number <= 2 else "INTERMEDIATE" for number in laps["LapNumber"]
+    ]
+    bronze = write_bronze(tmp_path / "bronze", make_qualifying_results(
+        q1=[95.0, 95.4, 95.9], q2=[94.0, 94.4, None], q3=[93.0, None, None]
+    ), laps)
+    db_path = tmp_path / "t.duckdb"
+    warehouse.build(SESSION, bronze, db_path)
+    connection = duckdb.connect(str(db_path), read_only=True)
+    try:
+        tyres = report.segment_tyres(connection)
+        page = report.render(connection, SESSION)
+    finally:
+        connection.close()
+
+    assert tyres[("FST", 1)] == "WET"
+    assert tyres[("FST", 3)] == "INTERMEDIATE"
+    assert report.COMPOUND_COLOURS["WET"] in page
+    assert report.COMPOUND_COLOURS["INTERMEDIATE"] in page
+
+
 def test_the_fastest_lap_says_which_tyre_it_was_set_on(rendered):
     page, _connection = rendered
 

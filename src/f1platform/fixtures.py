@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
 import sys
 from pathlib import Path
 
@@ -40,6 +41,9 @@ DROP_COLUMNS = frozenset({"HeadshotUrl"})
 # Columns the warehouse reads today. Not a filter -- a checklist, so a source
 # that stops providing one of them is caught here instead of in a silently
 # empty gold table weeks later.
+# Copied verbatim when present: it is small, and it carries the round number.
+SIDECAR_FILES = ("event.json",)
+
 REQUIRED_COLUMNS = {
     "results": (
         "DriverNumber", "Abbreviation", "BroadcastName", "DriverId", "FullName",
@@ -132,6 +136,12 @@ def export(
             f" ({dropped} dropped)" if dropped else "",
             size / 1024,
         )
+
+    for sidecar in SIDECAR_FILES:
+        if (source / sidecar).exists():
+            shutil.copyfile(source / sidecar, target / sidecar)
+            total_bytes += (target / sidecar).stat().st_size
+            LOGGER.info("%-22s copied verbatim", sidecar)
 
     if not manifest["tables"]:
         raise FileNotFoundError(f"{source} held none of {TABLES}")
