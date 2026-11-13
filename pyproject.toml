@@ -24,6 +24,7 @@ f1-ingest = "f1platform.ingest:main"
 f1-schema = "f1platform.schema:main"
 f1-build = "f1platform.warehouse:main"
 f1-fixture = "f1platform.fixtures:main"
+f1-report = "f1platform.report:main"
 
 [build-system]
 requires = ["hatchling"]
