@@ -1,3 +1,11 @@
+# Credentials never belong in this repository. F1 account details live in the
+# environment or in FastF1's own token store, outside the project folder.
+.env
+.env.*
+!.env.example
+*.pem
+secrets/
+
 # Recorded sessions and derived data are reproducible, so they stay out of git.
 # Small sample fixtures live under tests/fixtures/ and ARE committed.
 data/
