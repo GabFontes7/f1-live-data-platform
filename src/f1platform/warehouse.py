@@ -128,6 +128,154 @@ LIMIT 1
 """
 
 
+# A lap is usable for measuring pace only if nothing external slowed it.
+# TrackStatus is the concatenation of every status seen during the lap, so
+# '1' means the lap was green from start to finish while '12' means a yellow
+# appeared partway. FastF1's own accuracy check accepts yellow and calls
+# itself "slightly paranoid"; pace measurement is stricter, because a yellow
+# costs time in exactly the sector it covers. See docs/adr/0003.
+GOLD_REPRESENTATIVE_LAPS = """
+CREATE OR REPLACE TABLE gold_representative_laps AS
+SELECT
+    l.*,
+    l.track_status = '1'                     AS is_green,
+    l.track_status = '1'
+        AND NOT l.is_deleted
+        AND NOT l.is_in_lap
+        AND NOT l.is_out_lap
+        AND l.lap_time_seconds IS NOT NULL   AS is_representative
+FROM silver_laps AS l
+"""
+
+# A slope fitted to three laps is noise with a decimal point. Stints below
+# this many representative laps report their lap count and nothing else.
+MIN_LAPS_FOR_PACE = 4
+
+# Compounds run when the track is wet. Their stints are dominated by the
+# track drying, not by the tyre wearing out.
+WET_COMPOUNDS = ("INTERMEDIATE", "WET")
+
+# Two medians are comparable only when both drivers ran a similar share of
+# the race. Below this ratio of representative laps, the delta is measuring
+# two different races rather than two drivers.
+MIN_LAP_OVERLAP = 0.7
+
+GOLD_STINT_PACE = f"""
+CREATE OR REPLACE TABLE gold_stint_pace AS
+WITH usable AS (
+    SELECT * FROM gold_representative_laps WHERE is_representative
+)
+SELECT
+    l.session_slug,
+    l.driver_code,
+    l.stint,
+    any_value(l.compound)                        AS compound,
+    count(*)                                     AS representative_laps,
+    min(l.tyre_life)                             AS tyre_life_at_start,
+    CASE WHEN count(*) >= {MIN_LAPS_FOR_PACE}
+         THEN median(l.lap_time_seconds) END     AS median_pace_seconds,
+    CASE WHEN count(*) >= {MIN_LAPS_FOR_PACE}
+         THEN stddev_samp(l.lap_time_seconds) END AS consistency_seconds,
+    -- Seconds per extra lap of tyre age. Deliberately NOT called
+    -- degradation: it is the sum of at least three effects pulling in
+    -- opposite directions, and this pipeline measures only their total.
+    CASE WHEN count(*) >= {MIN_LAPS_FOR_PACE}
+         THEN regr_slope(l.lap_time_seconds, l.tyre_life) END
+                                                 AS lap_time_trend_s_per_lap,
+    any_value(l.compound) IN {WET_COMPOUNDS}     AS is_wet_compound,
+    -- A negative trend means the car got quicker as the tyre aged, so
+    -- something other than the tyre dominated the stint.
+    CASE WHEN count(*) >= {MIN_LAPS_FOR_PACE}
+         THEN regr_slope(l.lap_time_seconds, l.tyre_life) < 0 END
+                                                 AS trend_is_negative
+FROM usable AS l
+GROUP BY l.session_slug, l.driver_code, l.stint
+ORDER BY l.driver_code, l.stint
+"""
+"""Why `lap_time_trend_s_per_lap` is not called degradation.
+
+The slope of lap time against tyre age within a stint is the sum of at
+least three effects:
+
+* **tyre wear**, which makes laps slower, the only one the name would imply;
+* **fuel burn**, which makes every car quicker by roughly a twentieth of a
+  second per lap as the tank empties, and never stops;
+* **track evolution**, which on a drying track is larger than both. In the
+  2026 São Paulo race, 41 of 79 stints ran intermediates and the winner's
+  first two stints both trend negative -- the track was drying faster than
+  the tyres were wearing.
+
+Separating them needs a fuel-correction coefficient this pipeline has no
+evidence for, so it reports the total it can actually measure and names it
+accordingly. `trend_is_negative` marks the stints where the tyre was not
+the dominant term.
+"""
+
+# The only comparison in Formula 1 that controls for the car. Two drivers
+# share a car's strengths and its limitations, so the gap between them is
+# the closest thing to a measurement of the driver alone.
+GOLD_TEAMMATE_DELTA = f"""
+CREATE OR REPLACE TABLE gold_teammate_delta AS
+WITH driver_pace AS (
+    SELECT
+        l.session_slug,
+        l.driver_code,
+        r.team_name,
+        count(*)                      AS representative_laps,
+        median(l.lap_time_seconds)    AS median_pace_seconds
+    FROM gold_representative_laps AS l
+    JOIN silver_results AS r
+      ON r.driver_code = l.driver_code AND r.session_slug = l.session_slug
+    WHERE l.is_representative
+    GROUP BY l.session_slug, l.driver_code, r.team_name
+    HAVING count(*) >= {MIN_LAPS_FOR_PACE}
+),
+paired AS (
+    SELECT
+        a.session_slug,
+        a.driver_code,
+        a.team_name,
+        a.representative_laps,
+        a.median_pace_seconds,
+        b.driver_code             AS teammate_code,
+        b.median_pace_seconds     AS teammate_pace_seconds,
+        b.representative_laps     AS teammate_representative_laps,
+        -- How many teammates this driver has, not how many drivers the team
+        -- ran: a two-driver team gives each of them exactly one.
+        count(*) OVER (PARTITION BY a.session_slug, a.driver_code)
+                                  AS teammate_count
+    FROM driver_pace AS a
+    JOIN driver_pace AS b
+      ON b.team_name = a.team_name
+     AND b.session_slug = a.session_slug
+     AND b.driver_code <> a.driver_code
+)
+SELECT
+    session_slug,
+    driver_code,
+    team_name,
+    teammate_code,
+    representative_laps,
+    teammate_representative_laps,
+    median_pace_seconds,
+    teammate_pace_seconds,
+    -- Negative means quicker than the teammate.
+    median_pace_seconds - teammate_pace_seconds AS delta_seconds,
+    -- Two medians are only comparable when both drivers ran a similar share
+    -- of the race. In the 2026 Sao Paulo race Stroll retired on lap 30 with
+    -- a sick car, and his delta to Alonso reads -10s: an arithmetically
+    -- correct number that measures a broken car, not a slower driver.
+    least(representative_laps, teammate_representative_laps)::DOUBLE
+        / greatest(representative_laps, teammate_representative_laps)
+        >= {MIN_LAP_OVERLAP} AS is_comparable
+FROM paired
+-- A driver with more than one teammate in a session has no single
+-- comparison, so the delta would be ambiguous rather than wrong.
+WHERE teammate_count = 1
+ORDER BY delta_seconds
+"""
+
+
 def build(
     session_slug: str,
     bronze_dir: Path = DEFAULT_BRONZE_DIR,
@@ -151,12 +299,18 @@ def build(
         connection.execute(SILVER_LAPS, [session_slug, str(laps_parquet)])
         connection.execute(GOLD_CLASSIFICATION)
         connection.execute(GOLD_FASTEST_LAP)
+        connection.execute(GOLD_REPRESENTATIVE_LAPS)
+        connection.execute(GOLD_STINT_PACE)
+        connection.execute(GOLD_TEAMMATE_DELTA)
 
         for table in (
             "silver_results",
             "silver_laps",
             "gold_race_classification",
             "gold_fastest_lap",
+            "gold_representative_laps",
+            "gold_stint_pace",
+            "gold_teammate_delta",
         ):
             rows = connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
             LOGGER.info("%s: %s rows", table, f"{rows:,}")

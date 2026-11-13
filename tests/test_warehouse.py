@@ -133,3 +133,124 @@ def test_in_and_out_laps_are_flagged(built):
 def test_a_missing_bronze_session_is_refused(tmp_path):
     with pytest.raises(FileNotFoundError, match="f1-ingest"):
         warehouse.build("absent", tmp_path, tmp_path / "w.duckdb")
+
+
+# --- pace: which laps count, and what the trend actually measures ----------
+
+
+def make_pace_results() -> pd.DataFrame:
+    """Two teammates plus a driver whose race ended early."""
+    return pd.DataFrame(
+        {
+            "DriverNumber": ["1", "2", "3"],
+            "Abbreviation": ["FST", "SLW", "DNF"],
+            "FullName": ["Fast One", "Slow Two", "Broken Three"],
+            "TeamName": ["Alpha", "Alpha", "Beta"],
+            "Position": [1.0, 2.0, 3.0],
+            "ClassifiedPosition": ["1", "2", "R"],
+            "GridPosition": [1.0, 2.0, 3.0],
+            "Status": ["Finished", "Finished", "Retired"],
+            "Points": [25.0, 18.0, 0.0],
+            "Laps": [10.0, 10.0, 2.0],
+            "Time": [900.0, 5.0, None],
+        }
+    )
+
+
+def lap(driver, number, seconds, *, status="1", deleted=False,
+        pit_in=None, pit_out=None, compound="SOFT", tyre_life=None):
+    return {
+        "Driver": driver,
+        "LapNumber": float(number),
+        "LapTime": seconds,
+        "Stint": 1.0,
+        "Compound": compound,
+        "TyreLife": float(tyre_life if tyre_life is not None else number),
+        "FreshTyre": False,
+        "TrackStatus": status,
+        "Deleted": deleted,
+        "DeletedReason": "track limits" if deleted else "",
+        "IsAccurate": True,
+        "PitInTime": pit_in,
+        "PitOutTime": pit_out,
+    }
+
+
+@pytest.fixture
+def pace(tmp_path):
+    rows = [lap("FST", n, 90.0 + n * 0.1) for n in range(1, 7)]
+    rows += [lap("SLW", n, 91.0 + n * 0.1) for n in range(1, 7)]
+    rows += [
+        lap("FST", 7, 89.0, status="12"),          # a yellow appeared
+        lap("FST", 8, 88.0, deleted=True),         # deleted
+        lap("FST", 9, 95.0, pit_in=1.0),           # in-lap
+        lap("FST", 10, 96.0, pit_out=1.0),         # out-lap
+    ]
+    rows += [lap("DNF", n, 92.0) for n in range(1, 3)]  # too few laps
+    bronze = write_bronze(tmp_path / "bronze", make_pace_results(), pd.DataFrame(rows))
+    db_path = tmp_path / "pace.duckdb"
+    warehouse.build(SESSION, bronze, db_path)
+    connection = duckdb.connect(str(db_path), read_only=True)
+    yield connection
+    connection.close()
+
+
+def test_only_green_uninterrupted_laps_are_representative(pace):
+    excluded = pace.execute(
+        """
+        SELECT lap_number FROM gold_representative_laps
+        WHERE driver_code = 'FST' AND NOT is_representative
+        ORDER BY lap_number
+        """
+    ).fetchall()
+
+    assert [row[0] for row in excluded] == [7, 8, 9, 10], (
+        "yellow, deleted, in-lap and out-lap must all be excluded"
+    )
+
+
+def test_a_yellow_flag_lap_is_not_green(pace):
+    is_green = pace.execute(
+        "SELECT is_green FROM gold_representative_laps "
+        "WHERE driver_code = 'FST' AND lap_number = 7"
+    ).fetchone()[0]
+
+    assert is_green is False, "TrackStatus '12' means a yellow appeared mid-lap"
+
+
+def test_a_short_stint_reports_no_pace(pace):
+    row = pace.execute(
+        "SELECT representative_laps, median_pace_seconds, lap_time_trend_s_per_lap "
+        "FROM gold_stint_pace WHERE driver_code = 'DNF'"
+    ).fetchone()
+
+    assert row[0] == 2
+    assert row[1] is None, "a slope fitted to two laps is noise with a decimal point"
+    assert row[2] is None
+
+
+def test_the_trend_is_measured_not_assumed(pace):
+    trend = pace.execute(
+        "SELECT lap_time_trend_s_per_lap FROM gold_stint_pace "
+        "WHERE driver_code = 'FST'"
+    ).fetchone()[0]
+
+    assert trend == pytest.approx(0.1, abs=0.01), "0.1s added per lap of tyre age"
+
+
+def test_teammates_of_similar_race_length_are_comparable(pace):
+    row = pace.execute(
+        "SELECT delta_seconds, is_comparable FROM gold_teammate_delta "
+        "WHERE driver_code = 'FST'"
+    ).fetchone()
+
+    assert row[0] == pytest.approx(-1.0), "a second a lap quicker than the teammate"
+    assert row[1] is True
+
+
+def test_a_driver_without_a_teammate_is_absent(pace):
+    rows = pace.execute(
+        "SELECT count(*) FROM gold_teammate_delta WHERE driver_code = 'DNF'"
+    ).fetchone()[0]
+
+    assert rows == 0, "no teammate means no comparison, not a null one"
