@@ -1,0 +1,23 @@
+# Recorded sessions and derived data are reproducible, so they stay out of git.
+# Small sample fixtures live under tests/fixtures/ and ARE committed.
+data/
+!tests/fixtures/
+cache/
+*.duckdb
+*.duckdb.wal
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
