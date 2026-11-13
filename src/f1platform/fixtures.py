@@ -52,7 +52,7 @@ REQUIRED_COLUMNS = {
         "Sector1Time", "Sector2Time", "Sector3Time", "SpeedI1", "SpeedI2",
         "SpeedFL", "SpeedST", "IsPersonalBest", "TrackStatus", "Deleted",
         "DeletedReason", "IsAccurate", "FastF1Generated", "PitInTime",
-        "PitOutTime",
+        "PitOutTime", "LapStartDate",
     ),
     "weather_data": (
         "Time", "AirTemp", "TrackTemp", "Humidity", "Pressure", "Rainfall",

@@ -293,6 +293,66 @@ def test_a_session_without_laps_says_so_instead_of_drawing_nothing(tmp_path):
     assert "Nenhuma volta representativa" in rendered
 
 
+def two_session_warehouse(tmp_path):
+    """A race and a qualifying session, as the site will hold them."""
+    from tests.test_warehouse import make_qualifying_results, qualifying_laps
+
+    db_path = tmp_path / "site.duckdb"
+    bronze = tmp_path / "bronze"
+    for slug, results, laps in (
+        ("2026-somewhere-grand-prix-r", make_pace_results(),
+         pd.DataFrame(dry_laps())),
+        ("2026-somewhere-grand-prix-q",
+         make_qualifying_results(q1=[95.0, 95.4, 95.9], q2=[94.0, 94.4, None],
+                                 q3=[93.0, None, None]),
+         qualifying_laps()),
+    ):
+        (bronze / slug).mkdir(parents=True)
+        results.to_parquet(bronze / slug / "results.parquet", index=False)
+        laps.to_parquet(bronze / slug / "laps.parquet", index=False)
+        warehouse.build(slug, bronze, db_path)
+    return db_path
+
+
+def test_one_command_builds_every_page_and_an_index(tmp_path):
+    """A new grand prix is an ingest away from being on the site."""
+    db_path = two_session_warehouse(tmp_path)
+
+    written = report.build_site(db_path, tmp_path / "site")
+
+    names = sorted(path.name for path in written)
+    assert names == [
+        "2026-somewhere-grand-prix-q.html",
+        "2026-somewhere-grand-prix-r.html",
+        "index.html",
+    ]
+    index = (tmp_path / "site" / "index.html").read_text(encoding="utf-8")
+    assert "Somewhere Grand Prix 2026" in index
+    assert "Classificação" in index and "Corrida" in index
+
+
+def test_every_page_links_to_every_other(tmp_path):
+    db_path = two_session_warehouse(tmp_path)
+
+    report.build_site(db_path, tmp_path / "site")
+
+    race = (tmp_path / "site" / "2026-somewhere-grand-prix-r.html").read_text(
+        encoding="utf-8"
+    )
+    assert "href='2026-somewhere-grand-prix-q.html'" in race
+    assert "href='index.html'" in race
+    assert "href='2026-somewhere-grand-prix-r.html'" not in race, (
+        "a page does not link to itself"
+    )
+
+
+def test_the_fastest_lap_says_which_tyre_it_was_set_on(rendered):
+    page, _connection = rendered
+
+    assert "class='tyre'" in page
+    assert report.COMPOUND_COLOURS["SOFT"] in page
+
+
 def test_a_missing_warehouse_is_refused(tmp_path):
     with pytest.raises(FileNotFoundError, match="f1-build"):
         report.build_report(SESSION, tmp_path / "absent.duckdb", tmp_path)

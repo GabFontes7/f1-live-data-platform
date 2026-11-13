@@ -115,7 +115,9 @@ SELECT
     "PitInTime" IS NOT NULL         AS is_in_lap,
     "PitOutTime" IS NOT NULL        AS is_out_lap,
     CAST("PitInTime" AS DOUBLE)     AS pit_in_seconds,
-    CAST("PitOutTime" AS DOUBLE)    AS pit_out_seconds
+    CAST("PitOutTime" AS DOUBLE)    AS pit_out_seconds,
+    -- The one wall-clock column in the lap data: it is what dates a session.
+    CAST("LapStartDate" AS TIMESTAMP) AS lap_start_date
 FROM read_parquet(?)
 """
 
@@ -209,7 +211,9 @@ SELECT
     l.session_slug,
     l.driver_code,
     l.lap_number,
-    l.lap_time_seconds
+    l.lap_time_seconds,
+    l.compound,
+    l.tyre_life
 FROM silver_laps AS l
 JOIN silver_results AS r
   ON r.driver_code = l.driver_code
@@ -539,6 +543,7 @@ changes AS (
 laps AS (
     SELECT
         any_value(session_slug)                   AS session_slug,
+        CAST(min(lap_start_date) AS DATE)         AS session_date,
         max(lap_number)                           AS laps_run,
         count(DISTINCT driver_code)               AS cars_with_laps,
         sum(is_in_lap::INT)                       AS pit_stops,

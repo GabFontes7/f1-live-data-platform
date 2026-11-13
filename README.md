@@ -47,10 +47,23 @@ f1-report --session 2026-sao-paulo-grand-prix-r
 # sessions accumulate in one warehouse file
 f1-ingest --year 2026 --event "Sao Paulo Grand Prix" --session Q
 f1-build  --session 2026-sao-paulo-grand-prix-q
-f1-report --session 2026-sao-paulo-grand-prix-q
+
+# one command rebuilds the whole site: every session, plus index.html
+f1-report --all
 
 pytest -q
 ```
+
+### The site
+
+`f1-report --all` writes one self-contained HTML file per session into
+`reports/`, plus an `index.html` listing every grand prix in the warehouse.
+Every page carries a bar linking to every other session, and the links are bare
+file names, so the folder can be zipped, emailed or served from anywhere and
+still works — including from `file://`, with no server.
+
+Nothing in the site is written by hand. A new grand prix is an ingest, a build
+and `f1-report --all` away from being on it.
 
 A race and a qualifying session are different questions, so they get different
 pages: a race page is built around classification, strategy and position changes,

@@ -96,6 +96,34 @@ def fmt_lap(seconds: float | None) -> str:
     return f"{int(minutes)}:{rest:06.3f}"
 
 
+COMPOUND_LETTERS = {
+    "SOFT": "M", "MEDIUM": "M", "HARD": "D",
+    "INTERMEDIATE": "I", "WET": "C",
+}
+
+
+def tyre_badge(compound: str | None, *, with_name: bool = False) -> str:
+    """The tyre as television draws it: a coloured ring with its letter.
+
+    No emoji: there is no tyre emoji that comes in five colours, and a grey
+    one next to a compound name would say less than the ring does.
+    """
+    if compound is None:
+        return ""
+    colour = COMPOUND_COLOURS.get(compound, UNKNOWN_COLOUR)
+    # Soft is the one whose Portuguese initial clashes with medium, so the
+    # letters are chosen to stay distinct: M(acio), M(édio) -> use the first
+    # two letters for those two.
+    letter = {"SOFT": "Ma", "MEDIUM": "Mé", "HARD": "D",
+              "INTERMEDIATE": "I", "WET": "C"}.get(compound, "?")
+    badge = (f"<span class='tyre' style='border-color:{colour};color:{colour}'>"
+             f"{letter}</span>")
+    if with_name:
+        badge += (f"<span class='tyre-name' style='color:{colour}'>"
+                  f"{esc(compound_name(compound))}</span>")
+    return badge
+
+
 def compound_name(compound: str | None) -> str:
     if compound is None:
         return "Desconhecido"
@@ -1066,24 +1094,18 @@ def weather_cards(connection: duckdb.DuckDBPyConnection) -> str:
         return f"{lo:.0f}{unit}" if round(lo) == round(hi) else f"{lo:.0f}–{hi:.0f}{unit}"
 
     cards = [
-        ("🛣️", "Temperatura da pista", span(track_lo, track_hi, " °C")),
-        ("🌡️", "Temperatura do ar", span(air_lo, air_hi, " °C")),
-        ("💧", "Umidade", span(hum_lo, hum_hi, " %")),
+        ("🛣️", "Temperatura da pista", esc(span(track_lo, track_hi, " °C"))),
+        ("🌡️", "Temperatura do ar", esc(span(air_lo, air_hi, " °C"))),
+        ("💧", "Umidade", esc(span(hum_lo, hum_hi, " %"))),
         ("💨", "Vento", "—" if wind_mid is None else
          f"{wind_mid * 3.6:.0f} km/h (máx. {wind_hi * 3.6:.0f})"),
-        ("🧭", "Direção do vento", compass(wind_dir)),
+        ("🧭", "Direção do vento", esc(compass(wind_dir))),
         ("⏲️", "Pressão", "—" if pressure is None else f"{pressure:.0f} mbar"),
     ]
     if rain:
         cards.insert(0, ("🌧️", "Minutos com água no sensor",
                          f"{rain} de {samples}"))
-    body = "".join(
-        f"<div class='card'><span class='card-icon'>{icon}</span>"
-        f"<span class='card-value'>{esc(value)}</span>"
-        f"<span class='card-label'>{esc(label)}</span></div>"
-        for icon, label, value in cards
-    )
-    return (f"<div class='cards'>{body}</div>"
+    return (f"{cards_html(cards)}"
             f"<p class='note'>Valores medidos {scope}.</p>")
 
 
@@ -1676,6 +1698,16 @@ def podium(connection: duckdb.DuckDBPyConnection) -> str:
     ) + "</div>"
 
 
+def cards_html(cards: list[tuple[str, str, str]]) -> str:
+    """Values may carry markup (a tyre badge), so they arrive escaped."""
+    return "<div class='cards'>" + "".join(
+        f"<div class='card'><span class='card-icon'>{icon}</span>"
+        f"<span class='card-value'>{value}</span>"
+        f"<span class='card-label'>{esc(label)}</span></div>"
+        for icon, label, value in cards
+    ) + "</div>"
+
+
 def summary_cards(connection: duckdb.DuckDBPyConnection) -> str:
     """The race in cards. Fixed cards every race has; the rest earn their place.
 
@@ -1684,7 +1716,8 @@ def summary_cards(connection: duckdb.DuckDBPyConnection) -> str:
     """
     profile = session_profile(connection)
     fastest = connection.execute(
-        "SELECT driver_code, lap_time_seconds FROM gold_fastest_lap"
+        "SELECT driver_code, lap_time_seconds, compound, tyre_life "
+        "FROM gold_fastest_lap"
     ).fetchone()
 
     cards = []
@@ -1692,8 +1725,11 @@ def summary_cards(connection: duckdb.DuckDBPyConnection) -> str:
     if laps:
         cards.append(("🏁", "Distância", plural(int(laps), "volta", "voltas")))
     if fastest:
-        cards.append(("⚡", "Volta mais rápida",
-                      f"{fastest[0]} {fmt_lap(fastest[1])}"))
+        cards.append((
+            "⚡", "Volta mais rápida",
+            f"{esc(fastest[0])} {fmt_lap(fastest[1])} "
+            f"{tyre_badge(fastest[2], with_name=True)}",
+        ))
     margin, down = (profile.get("winning_margin_seconds"),
                     profile.get("runner_up_laps_down"))
     if margin is not None:
@@ -1724,12 +1760,7 @@ def summary_cards(connection: duckdb.DuckDBPyConnection) -> str:
         if value:
             cards.append((icon, label, f"{int(value)} de {counted}"))
 
-    return "<div class='cards'>" + "".join(
-        f"<div class='card'><span class='card-icon'>{icon}</span>"
-        f"<span class='card-value'>{esc(value)}</span>"
-        f"<span class='card-label'>{esc(label)}</span></div>"
-        for icon, label, value in cards
-    ) + "</div>"
+    return cards_html(cards)
 
 
 def lap_count_note(connection: duckdb.DuckDBPyConnection) -> str:
@@ -2200,9 +2231,18 @@ def qualifying_cards(connection: duckdb.DuckDBPyConnection) -> str:
         FROM gold_qualifying_result ORDER BY qualifying_position
         """
     ).fetchall()
+    pole_tyre = connection.execute(
+        "SELECT l.compound FROM silver_laps AS l JOIN gold_qualifying_result AS q "
+        "ON q.driver_code = l.driver_code AND q.qualifying_position = 1 "
+        "WHERE abs(l.lap_time_seconds - q.best_seconds) < 0.0005 LIMIT 1"
+    ).fetchone()
     cards = []
     if rows:
-        cards.append(("🏆", "Pole", f"{rows[0][0]} {fmt_lap(rows[0][3])}"))
+        cards.append((
+            "🏆", "Pole",
+            f"{esc(rows[0][0])} {fmt_lap(rows[0][3])} "
+            + (tyre_badge(pole_tyre[0], with_name=True) if pole_tyre else ""),
+        ))
     if len(rows) > 1 and rows[1][4] is not None:
         cards.append(("⏱️", "Para o segundo", f"{rows[1][4]:.3f} s"))
     cuts = {}
@@ -2212,6 +2252,15 @@ def qualifying_cards(connection: duckdb.DuckDBPyConnection) -> str:
     for segment in sorted(cuts):
         cards.append(("✂️", f"Eliminados no Q{segment}", f"{cuts[segment]}"))
     cards.append(("🧮", "Pilotos", f"{len(rows)}"))
+    fastest = connection.execute(
+        "SELECT driver_code, lap_time_seconds, compound FROM gold_fastest_lap"
+    ).fetchone()
+    if fastest and (not rows or fastest[1] > rows[0][3] + 0.0005):
+        cards.append((
+            "⚡", "Volta mais rápida da sessão",
+            f"{esc(fastest[0])} {fmt_lap(fastest[1])} "
+            f"{tyre_badge(fastest[2], with_name=True)}",
+        ))
     wet_share = connection.execute(
         "SELECT avg(wet_tyre_share) FROM gold_track_state"
     ).fetchone()[0] if has_table(connection, "gold_track_state") else None
@@ -2225,12 +2274,7 @@ def qualifying_cards(connection: duckdb.DuckDBPyConnection) -> str:
     ).fetchone()[0] if has_table(connection, "silver_race_control") else 0
     if reds:
         cards.append(("🟥", "Bandeiras vermelhas", f"{reds}"))
-    return "<div class='cards'>" + "".join(
-        f"<div class='card'><span class='card-icon'>{icon}</span>"
-        f"<span class='card-value'>{esc(value)}</span>"
-        f"<span class='card-label'>{esc(label)}</span></div>"
-        for icon, label, value in cards
-    ) + "</div>"
+    return cards_html(cards)
 
 
 def qualifying_podium(connection: duckdb.DuckDBPyConnection) -> str:
@@ -2460,6 +2504,11 @@ code { background: #f1f1ed; padding: 1px 4px; border-radius: 3px; font-size: 92%
 .card { background: #fff; border: 1px solid #e8e8e4;
         border-radius: 10px; padding: 11px 13px; }
 .card-icon { display: block; font-size: 19px; line-height: 1.1; margin-bottom: 3px; }
+.tyre { display: inline-block; min-width: 22px; height: 22px; line-height: 18px;
+        border: 2.5px solid #999; border-radius: 50%; text-align: center;
+        font-size: 11px; font-weight: 700; vertical-align: 2px; padding: 0 2px; }
+.tyre-name { font-size: 12.5px; font-weight: 600; margin-left: 5px;
+             vertical-align: 3px; }
 .card-value { display: block; font-size: 18px; font-weight: 650; }
 .card-label { display: block; color: #6b6b68; font-size: 12.5px; margin-top: 2px; }
 .podium { display: flex; flex-wrap: wrap; gap: 9px; margin: 0 0 9px; }
@@ -2565,6 +2614,29 @@ footer { margin-top: 44px; padding-top: 15px; border-top: 1px solid #e8e8e4;
        white-space: pre-line; box-shadow: 0 6px 20px rgba(0,0,0,.22); }
 #tip b { display: block; font-size: 13px; }
 .tabs > input { position: absolute; opacity: 0; pointer-events: none; }
+nav.sessions { display: flex; flex-wrap: wrap; align-items: center; gap: 7px 16px;
+               margin: 0 0 18px; padding: 9px 12px; background: #fff;
+               border: 1px solid #e8e8e4; border-radius: 10px; font-size: 13px; }
+nav.sessions .event { display: inline-flex; align-items: center; gap: 7px; }
+nav.sessions .event b { color: #45453f; font-weight: 650; }
+nav.sessions a { color: #1d4ed8; text-decoration: none; padding: 2px 7px;
+                 border-radius: 999px; background: #f1f4fd; }
+nav.sessions a:hover { background: #e2e8fb; }
+nav.sessions a.current { background: #1a1a19; color: #fff; cursor: default; }
+nav.sessions a.home { background: #f3f3ef; color: #45453f; margin-right: 4px; }
+.event-grid { display: grid; gap: 12px; margin-top: 16px;
+              grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); }
+.event-card { background: #fff; border: 1px solid #e8e8e4; border-radius: 12px;
+              padding: 6px 16px 14px; }
+.event-card h2 { margin: 12px 0 2px; font-size: 17px; }
+.event-card .when { display: block; color: #85857f; font-size: 12.5px;
+                    margin-bottom: 10px; }
+a.session { display: block; padding: 9px 11px; margin-bottom: 7px;
+            border: 1px solid #ececea; border-radius: 9px; text-decoration: none;
+            color: #1a1a19; }
+a.session:hover { border-color: #1a1a19; background: #fcfcfb; }
+a.session .facts { display: block; color: #6b6b68; font-size: 12.5px;
+                   margin-top: 2px; }
 nav.tabbar { display: flex; flex-wrap: wrap; gap: 3px; margin: 2px 0 20px;
              border-bottom: 1px solid #e3e3df; }
 nav.tabbar label { padding: 8px 13px; font-size: 13.5px; cursor: pointer;
@@ -2639,6 +2711,151 @@ def tab_css(slugs: list[str]) -> str:
     return "\n".join(rules)
 
 
+def event_of(slug: str) -> tuple[str, str, str]:
+    """(event title, year, session label) read from the slug's own shape."""
+    parts = slug.split("-")
+    if len(parts) > 2 and parts[0].isdigit():
+        label = SESSION_NAMES.get(parts[-1].lower(), parts[-1].upper())
+        return " ".join(parts[1:-1]).title(), parts[0], label
+    return slug.replace("-", " ").title(), "", ""
+
+
+def stored_sessions(connection: duckdb.DuckDBPyConnection) -> list[dict]:
+    """Every session in the warehouse, newest event first.
+
+    Read from the stored table rather than the scoped view, because this is
+    the one question on the page that is about all of them.
+    """
+    catalog = connection.execute(
+        "SELECT database_name FROM duckdb_databases() "
+        "WHERE database_name NOT IN ('system', 'temp') LIMIT 1"
+    ).fetchone()[0]
+    rows = connection.execute(
+        f'SELECT session_slug, session_kind, winner, race_laps, laps_run, '
+        f'wet_laps, safety_car_laps, red_flag_laps, on_track_position_changes, '
+        f'session_date FROM "{catalog}".main.gold_session_profile '
+        f'ORDER BY session_date DESC NULLS LAST, session_slug'
+    ).fetchall()
+    sessions = []
+    for row in rows:
+        event, year, label = event_of(row[0])
+        sessions.append({
+            "slug": row[0], "kind": row[1], "event": event, "year": year,
+            "label": label, "winner": row[2], "race_laps": row[3],
+            "laps_run": row[4], "wet_laps": row[5] or 0,
+            "safety_car_laps": row[6] or 0, "red_flag_laps": row[7] or 0,
+            "position_changes": row[8], "date": row[9],
+        })
+    return sessions
+
+
+# Sessions appear in the order a weekend runs, not alphabetically.
+SESSION_ORDER = ("fp1", "fp2", "fp3", "sq", "s", "q", "r")
+
+
+def session_rank(slug: str) -> int:
+    suffix = slug.rsplit("-", 1)[-1].lower()
+    return SESSION_ORDER.index(suffix) if suffix in SESSION_ORDER else 99
+
+
+def grouped_sessions(sessions: list[dict]) -> list[tuple[str, list[dict]]]:
+    """Events newest first, and inside each, the weekend's own running order."""
+    groups: dict[str, list[dict]] = {}
+    for session in sessions:
+        groups.setdefault(f"{session['event']} {session['year']}".strip(),
+                          []).append(session)
+    ordered = sorted(
+        groups.items(),
+        key=lambda pair: (
+            max((item["date"] for item in pair[1] if item["date"]), default=None)
+            is None,
+            [-(item["date"].toordinal()) for item in pair[1] if item["date"]][:1]
+            or [0],
+        ),
+    )
+    return [
+        (event, sorted(items, key=lambda item: session_rank(item["slug"])))
+        for event, items in ordered
+    ]
+
+
+def nav_html(sessions: list[dict], current: str | None) -> str:
+    """The bar that ties the pages together.
+
+    Links are bare file names, so the folder can be copied, zipped or served
+    from anywhere and the links keep working.
+    """
+    if len(sessions) < 2:
+        return ""
+    groups = []
+    for event, items in grouped_sessions(sessions):
+        links = "".join(
+            f"<a class='current'>{esc(item['label'])}</a>"
+            if item["slug"] == current else
+            f"<a href='{esc(item['slug'])}.html'>{esc(item['label'])}</a>"
+            for item in items
+        )
+        groups.append(f"<span class='event'><b>{esc(event)}</b>{links}</span>")
+    home = "<a class='home' href='index.html'>🏠 Todos os GPs</a>"
+    return f"<nav class='sessions'>{home}{''.join(groups)}</nav>"
+
+
+def index_page(sessions: list[dict]) -> str:
+    """The front page: every grand prix in the warehouse, with its sessions."""
+    cards = []
+    for event, items in grouped_sessions(sessions):
+        dates = [item["date"] for item in items if item["date"]]
+        when = (f"<span class='when'>{min(dates):%d/%m/%Y}</span>"
+                if dates else "")
+        lines = []
+        for item in items:
+            facts = []
+            if item["kind"] == "race":
+                if item["winner"]:
+                    facts.append(f"🏆 {item['winner']}")
+                if item["race_laps"]:
+                    facts.append(plural(int(item["race_laps"]), "volta", "voltas"))
+                if item["position_changes"] is not None:
+                    facts.append(
+                        f"{int(item['position_changes'])} trocas de posição")
+            if item["wet_laps"]:
+                facts.append("💦 pista molhada")
+            if item["safety_car_laps"]:
+                facts.append("🚨 safety car")
+            if item["red_flag_laps"]:
+                facts.append("🟥 bandeira vermelha")
+            lines.append(
+                f"<a class='session' href='{esc(item['slug'])}.html'>"
+                f"<b>{esc(item['label'])}</b>"
+                f"<span class='facts'>{esc(' · '.join(facts))}</span></a>"
+            )
+        cards.append(
+            f"<div class='event-card'><h2>{esc(event)}</h2>{when}"
+            f"{''.join(lines)}</div>"
+        )
+    body = f"<div class='event-grid'>{''.join(cards)}</div>"
+    return f"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>F1 — análises por sessão</title>
+<style>{STYLE}</style>
+</head>
+<body>
+<main>
+<h1>Fórmula 1 — análise por sessão</h1>
+<p class="sub">Cada página é construída a partir da cronometragem bruta, com um
+comando. Escolha uma sessão.</p>
+{body}
+<footer>Não oficial. Sem vínculo com a Formula 1. Gerado por
+f1-live-data-platform.</footer>
+</main>
+</body>
+</html>
+"""
+
+
 def session_title(slug: str) -> str:
     """'2026-sao-paulo-grand-prix-r' -> 'Sao Paulo Grand Prix 2026 — Corrida'."""
     parts = slug.split("-")
@@ -2649,7 +2866,11 @@ def session_title(slug: str) -> str:
     return slug.replace("-", " ").title()
 
 
-def render(connection: duckdb.DuckDBPyConnection, slug: str) -> str:
+def render(
+    connection: duckdb.DuckDBPyConnection,
+    slug: str,
+    sessions: list[dict] | None = None,
+) -> str:
     tabs = build_tabs(connection)
     slugs = [tab[0] for tab in tabs]
     title = session_title(slug)
@@ -2682,6 +2903,7 @@ def render(connection: duckdb.DuckDBPyConnection, slug: str) -> str:
 <h1>{esc(title)}</h1>
 <p class="sub">Construído a partir da cronometragem bruta. Todo número desta
 página sai do warehouse.</p>
+{nav_html(sessions or [], slug)}
 <div class="tabs">{radios}<nav class="tabbar">{bar}</nav>
 <div class="panels">{panels}</div></div>
 <footer>Não oficial. Sem vínculo com a Formula 1. Gerado por
@@ -2694,29 +2916,68 @@ f1-live-data-platform. Arquivo único: abre sem internet.</footer>
 """
 
 
+def write_session(
+    connection: duckdb.DuckDBPyConnection,
+    session_slug: str,
+    output_dir: Path,
+    sessions: list[dict],
+) -> Path:
+    scope_to_session(connection, session_slug)
+    if not connection.execute("SELECT count(*) FROM silver_laps").fetchone()[0]:
+        raise SessionNotInWarehouseError(
+            f"{session_slug} is not in the warehouse -- run f1-build for it first"
+        )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{session_slug}.html"
+    output_path.write_text(render(connection, session_slug, sessions),
+                           encoding="utf-8")
+    return output_path
+
+
+def open_warehouse(db_path: Path) -> duckdb.DuckDBPyConnection:
+    if not db_path.exists():
+        raise FileNotFoundError(f"{db_path} is missing -- run f1-build first")
+    return duckdb.connect(str(db_path), read_only=True)
+
+
 def build_report(
     session_slug: str,
     db_path: Path = DEFAULT_DB_PATH,
     output_dir: Path = DEFAULT_OUTPUT_DIR,
 ) -> Path:
-    if not db_path.exists():
-        raise FileNotFoundError(f"{db_path} is missing -- run f1-build first")
-
-    connection = duckdb.connect(str(db_path), read_only=True)
+    """One session's page, carrying links to every other session."""
+    connection = open_warehouse(db_path)
     try:
-        scope_to_session(connection, session_slug)
-        if not connection.execute("SELECT count(*) FROM silver_laps").fetchone()[0]:
-            raise SessionNotInWarehouseError(
-                f"{session_slug} is not in {db_path} -- run f1-build for it first"
-            )
-        page = render(connection, session_slug)
+        return write_session(
+            connection, session_slug, output_dir, stored_sessions(connection)
+        )
+    finally:
+        connection.close()
+
+
+def build_site(
+    db_path: Path = DEFAULT_DB_PATH,
+    output_dir: Path = DEFAULT_OUTPUT_DIR,
+) -> list[Path]:
+    """Every session in the warehouse, plus the index that links them.
+
+    One command rebuilds the whole site from the data, so a new grand prix is
+    an ingest away from being on it -- nothing is edited by hand.
+    """
+    connection = open_warehouse(db_path)
+    try:
+        sessions = stored_sessions(connection)
+        written = [
+            write_session(connection, session["slug"], output_dir, sessions)
+            for session in sessions
+        ]
     finally:
         connection.close()
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"{session_slug}.html"
-    output_path.write_text(page, encoding="utf-8")
-    return output_path
+    index = output_dir / "index.html"
+    index.write_text(index_page(sessions), encoding="utf-8")
+    return [index, *written]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2724,7 +2985,13 @@ def build_parser() -> argparse.ArgumentParser:
         prog="f1-report",
         description="Render a session as a self-contained HTML page.",
     )
-    parser.add_argument("--session", required=True, help="session slug")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--session", help="session slug")
+    group.add_argument(
+        "--all",
+        action="store_true",
+        help="build every session in the warehouse, plus index.html",
+    )
     parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     return parser
@@ -2738,12 +3005,16 @@ def main(argv: list[str] | None = None) -> int:
         datefmt="%H:%M:%S",
     )
     try:
-        path = build_report(args.session, args.db, args.output_dir)
+        if args.all:
+            paths = build_site(args.db, args.output_dir)
+        else:
+            paths = [build_report(args.session, args.db, args.output_dir)]
     except (FileNotFoundError, SessionNotInWarehouseError) as error:
         LOGGER.error("%s", error)
         return 1
 
-    LOGGER.info("report written to %s (%.0f KB)", path, path.stat().st_size / 1024)
+    for path in paths:
+        LOGGER.info("written %s (%.0f KB)", path, path.stat().st_size / 1024)
     return 0
 
 

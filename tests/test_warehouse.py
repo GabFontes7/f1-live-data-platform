@@ -57,6 +57,9 @@ def lap(driver, number, seconds, *, status="1", deleted=False,
         "FastF1Generated": False,
         "PitInTime": pit_in,
         "PitOutTime": pit_out,
+        # The only wall-clock column, and what dates a session.
+        "LapStartDate": pd.Timestamp("2026-11-08 14:00:00")
+        + pd.Timedelta(number * 90, unit="s"),
     }
 
 
