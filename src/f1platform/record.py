@@ -15,11 +15,13 @@ The recorder deliberately does no parsing. See docs/adr/0001.
 from __future__ import annotations
 
 import argparse
-import asyncio
 import logging
+import signal
 import sys
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -59,6 +61,44 @@ def size_of(path: Path) -> int:
     return path.stat().st_size if path.exists() else 0
 
 
+@dataclass
+class StopFlag:
+    """Set when the user asks to stop, so the supervisor knows not to reconnect."""
+
+    requested: bool = False
+
+
+@contextmanager
+def interrupt_guard():
+    """Make Ctrl+C visible to the supervisor, not just to the client.
+
+    `SignalRClient.start` catches KeyboardInterrupt itself, shuts down and
+    returns normally. Without this, a user pressing Ctrl+C would look exactly
+    like a session ending quietly, and the supervisor would reconnect -- so
+    stopping the recorder would take one Ctrl+C per reconnect, forever.
+
+    The handler records the intent *and* raises, so the client still gets to
+    close its connection cleanly on the way out.
+    """
+    flag = StopFlag()
+
+    def handler(signum, frame):  # noqa: ARG001 - signal handler signature
+        flag.requested = True
+        raise KeyboardInterrupt
+
+    try:
+        previous = signal.signal(signal.SIGINT, handler)
+    except ValueError:
+        # Not on the main thread; the caller handles interrupts its own way.
+        yield flag
+        return
+
+    try:
+        yield flag
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
 def record_once(path: Path, idle_timeout: int) -> None:
     """Run a single client session, appending to `path` if it already exists.
 
@@ -72,7 +112,7 @@ def record_once(path: Path, idle_timeout: int) -> None:
         filemode=filemode,
         timeout=idle_timeout,
     )
-    asyncio.run(client.async_start())
+    client.start()
 
 
 def record(
@@ -109,50 +149,56 @@ def record(
     consecutive_errors = 0
     started = time.monotonic()
 
-    while True:
-        attempt += 1
-        if attempt > 1:
-            LOGGER.info("reconnect attempt %d", attempt - 1)
+    with interrupt_guard() as stop:
+        while True:
+            attempt += 1
+            if attempt > 1:
+                LOGGER.info("reconnect attempt %d", attempt - 1)
 
-        bytes_before = size_of(path)
-        try:
-            runner(path, idle_timeout)
-        except KeyboardInterrupt:
-            LOGGER.info("stopped by user")
-            break
-        except Exception as error:  # noqa: BLE001 - the supervisor must survive anything
-            consecutive_errors += 1
-            LOGGER.error(
-                "client failed (%d in a row): %s: %s",
-                consecutive_errors,
-                type(error).__name__,
-                error,
-            )
-            if consecutive_errors >= max_consecutive_errors:
-                LOGGER.error(
-                    "giving up after %d failures in a row -- this looks like a bug "
-                    "or a bad argument, not a network problem",
-                    consecutive_errors,
-                )
+            bytes_before = size_of(path)
+            try:
+                runner(path, idle_timeout)
+            except KeyboardInterrupt:
+                LOGGER.info("stopped by user")
                 break
-        else:
-            consecutive_errors = 0
-            captured = size_of(path) - bytes_before
-            LOGGER.info(
-                "client exited cleanly, captured %s this run (%s total)",
-                f"{captured:,} bytes",
-                describe(path),
-            )
+            except Exception as error:  # noqa: BLE001 - the supervisor survives anything
+                consecutive_errors += 1
+                LOGGER.error(
+                    "client failed (%d in a row): %s: %s",
+                    consecutive_errors,
+                    type(error).__name__,
+                    error,
+                )
+                if consecutive_errors >= max_consecutive_errors:
+                    LOGGER.error(
+                        "giving up after %d failures in a row -- the client could not "
+                        "run at all, so check the error above: a bad argument, a broken "
+                        "install, or no route to the feed",
+                        consecutive_errors,
+                    )
+                    break
+            else:
+                if stop.requested:
+                    # The client caught the Ctrl+C itself and returned normally.
+                    LOGGER.info("stopped by user")
+                    break
+                consecutive_errors = 0
+                captured = size_of(path) - bytes_before
+                LOGGER.info(
+                    "client exited cleanly, captured %s this run (%s total)",
+                    f"{captured:,} bytes",
+                    describe(path),
+                )
 
-        if max_reconnects and (attempt - 1) >= max_reconnects:
-            LOGGER.info("reconnect limit reached, stopping")
-            break
+            if max_reconnects and (attempt - 1) >= max_reconnects:
+                LOGGER.info("reconnect limit reached, stopping")
+                break
 
-        try:
-            time.sleep(RECONNECT_BACKOFF_SECONDS)
-        except KeyboardInterrupt:
-            LOGGER.info("stopped by user")
-            break
+            try:
+                time.sleep(RECONNECT_BACKOFF_SECONDS)
+            except KeyboardInterrupt:
+                LOGGER.info("stopped by user")
+                break
 
     elapsed = time.monotonic() - started
     LOGGER.info("done after %.0f min -- %s", elapsed / 60, describe(path))

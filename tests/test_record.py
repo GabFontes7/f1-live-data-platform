@@ -11,6 +11,8 @@ twenty-four times in two minutes before the author stopped it by hand.
 
 from __future__ import annotations
 
+import signal
+
 import pytest
 
 from f1platform import record as rec
@@ -115,6 +117,37 @@ def test_clean_exits_reconnect_up_to_the_limit(tmp_path):
     rec.record(session="s", output_dir=tmp_path, max_reconnects=3, runner=quiet)
 
     assert calls["n"] == 4, "one first run plus three reconnects"
+
+
+def test_a_ctrl_c_the_client_swallowed_still_stops_the_recorder(tmp_path):
+    """SignalRClient.start catches KeyboardInterrupt and returns normally.
+
+    Without the interrupt guard that return is indistinguishable from a
+    session ending quietly, so the supervisor would reconnect and the user
+    would have to press Ctrl+C once per reconnect, forever.
+    """
+    calls = {"n": 0}
+
+    def swallows_the_interrupt(path, idle_timeout):
+        calls["n"] += 1
+        handler = signal.getsignal(signal.SIGINT)
+        try:
+            handler(signal.SIGINT, None)
+        except KeyboardInterrupt:
+            pass  # exactly what the real client does
+
+    rec.record(session="s", output_dir=tmp_path, runner=swallows_the_interrupt)
+
+    assert calls["n"] == 1, "one Ctrl+C must be enough"
+
+
+def test_interrupt_guard_restores_the_previous_handler():
+    before = signal.getsignal(signal.SIGINT)
+
+    with rec.interrupt_guard():
+        assert signal.getsignal(signal.SIGINT) is not before
+
+    assert signal.getsignal(signal.SIGINT) is before
 
 
 def test_user_interrupt_stops_immediately(tmp_path):
