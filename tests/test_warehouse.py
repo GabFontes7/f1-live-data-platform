@@ -9,6 +9,7 @@ quicker still, a lapped finisher. CI runs these without any downloaded data.
 from __future__ import annotations
 
 import json
+import shutil
 
 import duckdb
 import pandas as pd
@@ -397,6 +398,22 @@ def test_a_session_without_event_metadata_still_builds(tmp_path):
         connection.close()
 
     assert round_number is None
+
+
+def test_a_session_can_be_forgotten(tmp_path):
+    """A slug that changed leaves a session nothing else would delete."""
+    bronze = write_bronze(tmp_path / "bronze", make_pace_results(),
+                          pd.DataFrame([lap("FST", n, 90.0) for n in range(1, 5)]))
+    shutil.copytree(bronze / SESSION, bronze / "2026-stale-r")
+    db_path = tmp_path / "f.duckdb"
+    warehouse.build(SESSION, bronze, db_path)
+    warehouse.build("2026-stale-r", bronze, db_path)
+
+    removed = warehouse.forget("2026-stale-r", db_path)
+
+    assert removed == 4
+    assert [row[0] for row in warehouse.stored_sessions(db_path)] == [SESSION]
+    assert warehouse.forget("2026-never-existed-r", db_path) == 0
 
 
 def test_two_sessions_live_in_one_warehouse_without_mixing(tmp_path):

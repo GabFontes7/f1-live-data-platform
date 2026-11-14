@@ -856,6 +856,43 @@ def drop_session(
             )
 
 
+def stored_sessions(db_path: Path) -> list[tuple[str, str, int]]:
+    """What the warehouse holds: slug, kind and lap count, oldest first."""
+    if not db_path.exists():
+        raise FileNotFoundError(f"{db_path} is missing -- run f1-build first")
+    connection = duckdb.connect(str(db_path), read_only=True)
+    try:
+        return connection.execute(
+            "SELECT session_slug, session_kind, laps_run "
+            "FROM gold_session_profile ORDER BY session_date, session_slug"
+        ).fetchall()
+    finally:
+        connection.close()
+
+
+def forget(session_slug: str, db_path: Path) -> int:
+    """Remove one session from the warehouse.
+
+    A warehouse accumulates, which is the point -- but a session ingested
+    under a name that later changed stays behind, and nothing else would
+    ever delete it.
+    """
+    if not db_path.exists():
+        raise FileNotFoundError(f"{db_path} is missing")
+    connection = duckdb.connect(str(db_path))
+    try:
+        catalog = catalog_of(connection)
+        before = connection.execute(
+            f'SELECT count(*) FROM "{catalog}".main.silver_laps '
+            "WHERE session_slug = ?",
+            [session_slug],
+        ).fetchone()[0]
+        drop_session(connection, catalog, session_slug)
+    finally:
+        connection.close()
+    return before
+
+
 def build(
     session_slug: str,
     bronze_dir: Path = DEFAULT_BRONZE_DIR,
@@ -976,7 +1013,12 @@ def build_parser() -> argparse.ArgumentParser:
         prog="f1-build",
         description="Build the DuckDB warehouse from a bronze session.",
     )
-    parser.add_argument("--session", required=True, help="bronze slug")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--session", help="bronze slug to build")
+    group.add_argument("--forget", help="remove a session from the warehouse")
+    group.add_argument(
+        "--list", action="store_true", help="list the sessions the warehouse holds"
+    )
     parser.add_argument("--bronze-dir", type=Path, default=DEFAULT_BRONZE_DIR)
     parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     return parser
@@ -990,6 +1032,19 @@ def main(argv: list[str] | None = None) -> int:
         datefmt="%H:%M:%S",
     )
     try:
+        if args.list:
+            sessions = stored_sessions(args.db)
+            LOGGER.info("%d session(s) in %s", len(sessions), args.db)
+            for slug, kind, laps in sessions:
+                LOGGER.info("  %-38s %-11s %s laps", slug, kind, laps)
+            return 0
+        if args.forget:
+            rows = forget(args.forget, args.db)
+            if rows:
+                LOGGER.info("forgot %s (%s lap rows removed)", args.forget, rows)
+            else:
+                LOGGER.warning("%s was not in %s", args.forget, args.db)
+            return 0
         db_path = build(args.session, args.bronze_dir, args.db)
     except FileNotFoundError as error:
         LOGGER.error("%s", error)

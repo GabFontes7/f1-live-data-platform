@@ -134,6 +134,16 @@ def plural(count: int, one: str, many: str) -> str:
     return f"{count} {one if count == 1 else many}"
 
 
+def whole(value: object, *, missing: str = "—") -> str:
+    """A number from the database as a plain integer, or a dash if absent.
+
+    Across a season every nullable column eventually arrives null: a driver
+    with no grid slot, a qualifying entry with no position. A page that
+    crashes on one of them takes the other thirty-nine sessions with it.
+    """
+    return missing if value is None else str(int(value))
+
+
 def table_of(
     connection: duckdb.DuckDBPyConnection,
     sql: str,
@@ -654,7 +664,8 @@ def stint_chart(connection: duckdb.DuckDBPyConnection) -> str:
         if not fresh and life is not None:
             tyre += f" (já tinha {int(life) - 1} voltas)"
         hover = tip(
-            f"{code} · stint {int(stint)} · {compound_name(compound)}",
+            f"{code} · stint {whole(stint, missing='?')} · "
+            f"{compound_name(compound)}",
             f"Voltas {first} a {last} — {plural(laps, 'volta', 'voltas')}",
             f"Pneu {tyre}",
             (f"Ritmo mediano: {fmt_lap(pace)} em "
@@ -869,7 +880,8 @@ def stint_pace_chart(connection: duckdb.DuckDBPyConnection) -> str:
                 trend_text = (f"Tendência: {trend:+.3f} s por volta "
                               f"({direction})")
             hover = tip(
-                f"{code} · stint {int(stint)} · {compound_name(compound)}",
+                f"{code} · stint {whole(stint, missing='?')} · "
+                f"{compound_name(compound)}",
                 f"Ritmo mediano: {fmt_lap(pace)}",
                 f"{plural(int(laps), 'volta limpa', 'voltas limpas')}",
                 f"Regularidade (desvio): {spread:.3f} s" if spread is not None
@@ -1650,7 +1662,9 @@ def classification_table(connection: duckdb.DuckDBPyConnection) -> str:
         else:
             time_cell = "—"
 
-        if gained is None:
+        if grid is not None and int(grid) == 0:
+            change = "<span class='muted-cell'>dos boxes</span>"
+        elif gained is None:
             change = "—"
         elif gained > 0:
             change = f"<span class='up'>▲ {int(gained)}</span>"
@@ -1666,9 +1680,9 @@ def classification_table(connection: duckdb.DuckDBPyConnection) -> str:
             f"<tr{klass}><td class='pos'>{esc(position)}</td>"
             f"<td>{swatch}<b>{esc(code)}</b> {esc(name)}</td>"
             f"<td>{esc(team)}</td><td>{esc(STATUS_NAMES.get(status, status))}</td>"
-            f"<td class='num'>{int(grid)}</td><td class='num'>{change}</td>"
-            f"<td class='num'>{int(laps)}</td><td class='num'>{time_cell}</td>"
-            f"<td class='num'>{points:g}</td></tr>"
+            f"<td class='num'>{whole(grid)}</td><td class='num'>{change}</td>"
+            f"<td class='num'>{whole(laps)}</td><td class='num'>{time_cell}</td>"
+            f"<td class='num'>{0 if points is None else points:g}</td></tr>"
         )
 
     return (
@@ -2188,7 +2202,8 @@ def qualifying_table(connection: duckdb.DuckDBPyConnection) -> str:
                q1_seconds, q2_seconds, q3_seconds, best_seconds,
                gap_to_pole_seconds, eliminated_in,
                q1_timed_laps, q2_timed_laps, q3_timed_laps
-        FROM gold_qualifying_result ORDER BY qualifying_position
+        FROM gold_qualifying_result
+        ORDER BY qualifying_position NULLS LAST
         """
     ).fetchall()
     colours = team_colours(connection)
@@ -2227,6 +2242,10 @@ def qualifying_table(connection: duckdb.DuckDBPyConnection) -> str:
             )
 
         klass = f" class='out-q{eliminated}'" if eliminated else ""
+        if position is None:
+            # No position in the published result: the driver took part but
+            # the result does not rank him. Seen in the 2026 season.
+            klass = " class='unclassified'"
         swatch = (f"<i class='swatch' style='background:"
                   f"{colours.get(code, UNKNOWN_COLOUR)}'></i>")
         # A Q1 time and a Q3 time were set on different tracks: in this wet
@@ -2240,7 +2259,7 @@ def qualifying_table(connection: duckdb.DuckDBPyConnection) -> str:
         else:
             to_pole = f"+{gap:.3f}"
         body.append(
-            f"<tr{klass}><td class='pos'>{int(position)}</td>"
+            f"<tr{klass}><td class='pos'>{whole(position)}</td>"
             f"<td>{swatch}<b>{esc(code)}</b> {esc(name)}</td>"
             f"<td>{esc(team)}</td>{''.join(cells)}"
             f"<td class='num'>{to_pole}</td></tr>"
@@ -2258,13 +2277,16 @@ def qualifying_cards(connection: duckdb.DuckDBPyConnection) -> str:
         """
         SELECT driver_code, driver_name, team_name, best_seconds,
                gap_to_pole_seconds, eliminated_in
-        FROM gold_qualifying_result ORDER BY qualifying_position
+        FROM gold_qualifying_result
+        WHERE best_seconds IS NOT NULL
+        ORDER BY qualifying_position NULLS LAST
         """
     ).fetchall()
     pole_tyre = connection.execute(
         "SELECT l.compound FROM silver_laps AS l JOIN gold_qualifying_result AS q "
         "ON q.driver_code = l.driver_code AND q.qualifying_position = 1 "
-        "WHERE abs(l.lap_time_seconds - q.best_seconds) < 0.0005 LIMIT 1"
+        "WHERE q.best_seconds IS NOT NULL "
+        "AND abs(l.lap_time_seconds - q.best_seconds) < 0.0005 LIMIT 1"
     ).fetchone()
     cards = []
     if rows:
@@ -2310,7 +2332,8 @@ def qualifying_cards(connection: duckdb.DuckDBPyConnection) -> str:
 def qualifying_podium(connection: duckdb.DuckDBPyConnection) -> str:
     rows = connection.execute(
         "SELECT driver_code, driver_name, team_name, best_seconds "
-        "FROM gold_qualifying_result ORDER BY qualifying_position LIMIT 3"
+        "FROM gold_qualifying_result WHERE best_seconds IS NOT NULL "
+        "ORDER BY qualifying_position NULLS LAST LIMIT 3"
     ).fetchall()
     colours = team_colours(connection)
     labels = ("Pole", "2º", "3º")

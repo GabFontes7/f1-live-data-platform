@@ -116,6 +116,28 @@ def test_one_session_is_rendered_even_when_the_warehouse_holds_several(tmp_path)
     assert "1:25.000" not in page, "no lap from the other session on the page"
 
 
+def test_a_driver_without_a_position_does_not_break_the_page(tmp_path):
+    """Across a season, every nullable column eventually arrives null."""
+    from tests.test_warehouse import make_qualifying_results, qualifying_laps
+
+    results = make_qualifying_results(
+        q1=[95.0, 95.4, None], q2=[94.0, 94.4, None], q3=[93.0, None, None]
+    )
+    results["Position"] = [1.0, 2.0, None]
+    bronze = write_bronze(tmp_path / "bronze", results, qualifying_laps())
+    db_path = tmp_path / "null.duckdb"
+    warehouse.build(SESSION, bronze, db_path)
+    connection = duckdb.connect(str(db_path), read_only=True)
+    try:
+        page = report.render(connection, SESSION)
+    finally:
+        connection.close()
+
+    assert "DNF" in page, "the driver is still listed"
+    assert "<td class='pos'>—</td>" in page, "with a dash where the position was"
+    assert "Pole" in page and "FST" in page
+
+
 def test_a_qualifying_session_gets_its_own_page(tmp_path):
     """A qualifying session is not a short race: different tabs, different cards."""
     from tests.test_warehouse import make_qualifying_results, qualifying_laps
