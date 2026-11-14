@@ -16,7 +16,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -51,6 +53,28 @@ class EmptySessionError(RuntimeError):
     """Raised when a session loads without error but carries no data."""
 
 
+# Letters that carry no accent to strip, so folding to ASCII would drop them
+# silently: "Großer" would become "groer". Rare in a Formula 1 calendar, and
+# a lost letter is a worse bug than a few lines of table.
+TRANSLITERATIONS = str.maketrans({
+    "ß": "ss", "ø": "o", "Ø": "O", "ł": "l", "Ł": "L",
+    "đ": "d", "Đ": "D", "æ": "ae", "Æ": "AE", "œ": "oe", "Œ": "OE",
+})
+
+
+def slugify(text: str) -> str:
+    """A slug that is the same whoever typed the event's name.
+
+    FastF1's schedule says "São Paulo Grand Prix"; a person types "Sao Paulo
+    Grand Prix". Without folding the accent away those are two slugs, two
+    bronze directories and two of the same session in the warehouse -- which
+    is exactly what happened the first time a season was ingested.
+    """
+    folded = unicodedata.normalize("NFKD", text.translate(TRANSLITERATIONS))
+    ascii_only = folded.encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", ascii_only.lower())).strip("-")
+
+
 @dataclass(frozen=True)
 class SessionRef:
     """Everything needed to name and fetch one session."""
@@ -61,8 +85,7 @@ class SessionRef:
 
     @property
     def slug(self) -> str:
-        event = self.event.lower().replace(" ", "-")
-        return f"{self.year}-{event}-{self.session.lower()}"
+        return f"{self.year}-{slugify(self.event)}-{slugify(self.session)}"
 
 
 def load_session(ref: SessionRef, cache_dir: Path) -> fastf1.core.Session:

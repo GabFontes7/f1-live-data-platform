@@ -38,6 +38,26 @@ def test_slug_is_stable_and_readable():
     assert ref.slug == "2026-sao-paulo-grand-prix-r"
 
 
+def test_the_same_event_gives_one_slug_however_it_is_spelled():
+    """FastF1 says "São Paulo"; a person types "Sao Paulo". One session."""
+    typed = ing.SessionRef(2026, "Sao Paulo Grand Prix", "R")
+    from_schedule = ing.SessionRef(2026, "São Paulo Grand Prix", "R")
+
+    assert typed.slug == from_schedule.slug == "2026-sao-paulo-grand-prix-r"
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("Emilia-Romagna Grand Prix", "2026-emilia-romagna-grand-prix-r"),
+        ("  Mexico  City  Grand Prix ", "2026-mexico-city-grand-prix-r"),
+        ("Großer Preis", "2026-grosser-preis-r"),
+    ],
+)
+def test_a_slug_holds_no_surprises(name, expected):
+    assert ing.SessionRef(2026, name, "R").slug == expected
+
+
 def test_slug_separates_sessions_of_the_same_event():
     race = ing.SessionRef(2026, "Las Vegas Grand Prix", "R")
     quali = ing.SessionRef(2026, "Las Vegas Grand Prix", "Q")
