@@ -53,6 +53,20 @@ class EmptySessionError(RuntimeError):
     """Raised when a session loads without error but carries no data."""
 
 
+class SessionNotRunError(EmptySessionError):
+    """Raised for a session that is still in the future.
+
+    It is empty for the most ordinary reason there is, and saying "check
+    your Formula 1 sign-in" about next week's race sends someone to debug
+    credentials that are working.
+    """
+
+
+# A session that started this long ago should have data. Inside the window,
+# an empty session is treated as "not finished publishing" rather than broken.
+JUST_RUN = pd.Timedelta(6, unit="h")
+
+
 # Letters that carry no accent to strip, so folding to ASCII would drop them
 # silently: "Großer" would become "groer". Rare in a Formula 1 calendar, and
 # a lost letter is a worse bug than a few lines of table.
@@ -88,11 +102,27 @@ class SessionRef:
         return f"{self.year}-{slugify(self.event)}-{slugify(self.session)}"
 
 
+def scheduled_for(session: fastf1.core.Session) -> pd.Timestamp | None:
+    """When this session was due to start, if the schedule says."""
+    when = getattr(session, "date", None)
+    if when is None or pd.isna(when):
+        event = getattr(session, "event", None)
+        try:
+            when = None if event is None else event["EventDate"]
+        except (KeyError, IndexError, TypeError):
+            when = None
+    if when is None or pd.isna(when):
+        return None
+    stamp = pd.Timestamp(when)
+    return stamp.tz_localize(None) if stamp.tzinfo else stamp
+
+
 def load_session(ref: SessionRef, cache_dir: Path) -> fastf1.core.Session:
     """Load a session from FastF1, refusing to return an empty one.
 
-    An empty result almost always means the F1 account sign-in failed, so the
-    error says that rather than leaving the caller to guess.
+    An empty session has two very different causes, and the message has to
+    tell them apart: the Formula 1 sign-in failed, or the session simply has
+    not happened yet. Ingesting a season hits the second one every time.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
     # `enable_cache` is deprecated in FastF1 3.9 and removed in a future
@@ -104,6 +134,12 @@ def load_session(ref: SessionRef, cache_dir: Path) -> fastf1.core.Session:
 
     drivers = len(session.results) if session.results is not None else 0
     if drivers == 0:
+        when = scheduled_for(session)
+        if when is not None and when > pd.Timestamp.now() - JUST_RUN:
+            raise SessionNotRunError(
+                f"{ref.slug} has not run yet -- it is scheduled for "
+                f"{when:%d %b %Y}. Nothing to ingest."
+            )
         raise EmptySessionError(
             f"{ref.slug} loaded without error but contains no drivers. FastF1 "
             "returns an empty session when the Formula 1 sign-in fails, so "
@@ -256,17 +292,22 @@ def ingest_season(
     refs = season_refs(year, sessions, cache_dir)
     LOGGER.info("%d sessions to ingest for %d", len(refs), year)
     done: list[str] = []
+    pending: list[str] = []
     failed: list[tuple[str, str]] = []
     for index, ref in enumerate(refs, start=1):
         LOGGER.info("[%d/%d] %s", index, len(refs), ref.slug)
         try:
             ingest(ref, output_dir, cache_dir)
+        except SessionNotRunError:
+            # Half a season is in the future on any day but the last one.
+            LOGGER.info("  not run yet, skipping %s", ref.slug)
+            pending.append(ref.slug)
         except Exception as error:  # noqa: BLE001 - one bad session, not the run
             LOGGER.warning("  skipped %s: %s", ref.slug, error)
             failed.append((ref.slug, str(error)))
-            continue
-        done.append(ref.slug)
-    return done, failed
+        else:
+            done.append(ref.slug)
+    return done, pending, failed
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -309,12 +350,17 @@ def main(argv: list[str] | None = None) -> int:
         if unknown:
             LOGGER.error("unknown session code(s): %s", ", ".join(unknown))
             return 2
-        done, failed = ingest_season(
+        done, pending, failed = ingest_season(
             args.year, sessions, args.output_dir, args.cache_dir
         )
-        LOGGER.info("ingested %d sessions, skipped %d", len(done), len(failed))
+        LOGGER.info(
+            "ingested %d sessions; %d not run yet; %d failed",
+            len(done), len(pending), len(failed),
+        )
+        if pending:
+            LOGGER.info("  still to come: %s", ", ".join(pending))
         for slug, reason in failed:
-            LOGGER.info("  skipped %s: %s", slug, reason)
+            LOGGER.warning("  failed %s: %s", slug, reason)
         return 0 if done else 1
 
     if not args.event or not args.session:

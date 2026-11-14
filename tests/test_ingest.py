@@ -161,15 +161,40 @@ def test_one_broken_session_does_not_stop_the_season(monkeypatch, tmp_path):
         attempted.append(ref.slug)
         if ref.slug == "2026-alpha-grand-prix-r":
             raise ing.EmptySessionError("no drivers")
+        if ref.slug == "2026-beta-grand-prix-r":
+            raise ing.SessionNotRunError("has not run yet")
         return output_dir / ref.slug
 
     monkeypatch.setattr(ing, "ingest", flaky)
-    done, failed = ing.ingest_season(2026, ("Q", "R"), tmp_path, tmp_path)
+    done, pending, failed = ing.ingest_season(2026, ("Q", "R"), tmp_path, tmp_path)
 
     assert len(attempted) == 4
-    assert done == ["2026-alpha-grand-prix-q", "2026-beta-grand-prix-q",
-                    "2026-beta-grand-prix-r"]
+    assert done == ["2026-alpha-grand-prix-q", "2026-beta-grand-prix-q"]
+    assert pending == ["2026-beta-grand-prix-r"], "the future is not a failure"
     assert failed == [("2026-alpha-grand-prix-r", "no drivers")]
+
+
+def test_a_session_that_has_not_run_says_so(monkeypatch, tmp_path):
+    """Half a season is in the future: do not blame the sign-in for it."""
+    session = FakeSession(pd.DataFrame())
+    session.date = pd.Timestamp.now() + pd.Timedelta(8, unit="D")
+    monkeypatch.setattr(ing.fastf1, "get_session", lambda *a, **k: session)
+
+    with pytest.raises(ing.SessionNotRunError, match="has not run yet"):
+        ing.load_session(ing.SessionRef(2026, "Las Vegas Grand Prix", "R"),
+                         tmp_path)
+
+
+def test_a_past_session_with_no_drivers_still_blames_the_sign_in(
+    monkeypatch, tmp_path
+):
+    session = FakeSession(pd.DataFrame())
+    session.date = pd.Timestamp.now() - pd.Timedelta(30, unit="D")
+    monkeypatch.setattr(ing.fastf1, "get_session", lambda *a, **k: session)
+
+    with pytest.raises(ing.EmptySessionError, match="sign-in"):
+        ing.load_session(ing.SessionRef(2026, "Sao Paulo Grand Prix", "R"),
+                         tmp_path)
 
 
 # --- the guard that matters -------------------------------------------------
